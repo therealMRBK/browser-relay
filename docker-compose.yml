@@ -1,0 +1,19 @@
+services:
+  app:
+    build: .
+    image: desktop-relay:latest
+    container_name: desktop-relay
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8094}:3000"
+    environment:
+      DISPLAY_WIDTH: ${DISPLAY_WIDTH:-1920}
+      DISPLAY_HEIGHT: ${DISPLAY_HEIGHT:-1080}
+      TARGET_FPS: ${TARGET_FPS:-24}
+      DATA_DIR: /data
+    volumes:
+      - desktop-relay-data:/data
+    shm_size: "1gb"
+
+volumes:
+  desktop-relay-data:

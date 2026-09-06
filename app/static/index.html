@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>Stiewi</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: system-ui, sans-serif; background: #1c1c1c; color: #eee;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  /* No toolbar row at all -- it was eating into the video, and the whole
+     point here is filling the browser window. Files access is a small
+     floating button overlaid on the corner instead, not a layout element
+     that reserves space. No padding/centering box either: the remote
+     desktop's actual resolution is kept matched to this container's exact
+     pixel size (see requestResize), so the image fills it edge-to-edge. */
+  .viewport-wrap { flex: 1; min-height: 0; position: relative; overflow: hidden; }
+  #viewport { position: absolute; inset: 0; outline: none; }
+  #screen { display: block; width: 100%; height: 100%; background: #000; }
+  #overlay { position: absolute; top: 0; left: 0; right: 0; bottom: 0; cursor: default; }
+  #filesBtn {
+    position: absolute; top: 8px; right: 8px; z-index: 21;
+    background: rgba(42,42,42,0.75); color: #eee; border: 1px solid rgba(74,74,74,0.8); border-radius: 6px;
+    padding: 4px 10px; cursor: pointer; font-size: 0.8rem; backdrop-filter: blur(2px);
+  }
+  #filesBtn:hover { background: rgba(69,69,69,0.9); }
+  .panel {
+    position: absolute; top: 44px; right: 8px; width: 320px; max-height: 60vh; overflow-y: auto;
+    background: #2a2a2a; border: 1px solid #4a4a4a; border-radius: 8px; padding: 10px;
+    font-size: 0.85rem; z-index: 20; display: none; box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  }
+  .panel.open { display: block; }
+  .panel .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 5px 2px; border-bottom: 1px solid #383838; }
+  .panel .row:last-child { border-bottom: none; }
+  .panel a { color: #7ab8ff; text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .panel .empty { color: #777; padding: 6px 2px; }
+  .panel .upload-row { padding-top: 8px; }
+</style>
+</head>
+<body>
+<div class="viewport-wrap">
+  <div id="viewport" tabindex="0">
+    <img id="screen" src="/stream" alt="Remote-Desktop">
+    <div id="overlay"></div>
+  </div>
+  <button id="filesBtn">📁</button>
+  <div class="panel" id="filesPanel">
+    <div id="filesList"></div>
+    <div class="upload-row">
+      <input type="file" id="uploadInput" style="width:100%">
+      <p style="color:#888;margin:6px 0 0 0">
+        Hochgeladene Dateien landen im gemeinsamen Ordner -- im Desktop bei jedem Datei-Dialog dorthin navigieren.
+        Downloads aus Chrome erscheinen hier automatisch.
+      </p>
+    </div>
+  </div>
+</div>
+
+<script>
+const viewport = document.getElementById('viewport');
+const overlay = document.getElementById('overlay');
+const screen = document.getElementById('screen');
+const filesBtn = document.getElementById('filesBtn');
+const filesPanel = document.getElementById('filesPanel');
+const filesList = document.getElementById('filesList');
+const uploadInput = document.getElementById('uploadInput');
+
+let REMOTE_WIDTH = 1600, REMOTE_HEIGHT = 900;
+fetch('/info').then((r) => r.json()).then((d) => { REMOTE_WIDTH = d.width; REMOTE_HEIGHT = d.height; }).catch(() => {});
+
+async function post(path, body) {
+  try {
+    const res = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) });
+    return await res.json().catch(() => null);
+  } catch (e) { console.error(path, e); return null; }
+}
+
+// Keeps the *actual remote desktop resolution* matched to this container's
+// real pixel size (a genuine xrandr mode switch server-side, see /resize in
+// server.js) -- not a CSS scale of a fixed-size stream. That's what makes
+// this "fill the browser window" rather than a shrunk/letterboxed video:
+// text stays crisp because the remote is rendering at exactly the size
+// it's displayed at. ffmpeg has to restart to change capture size, so this
+// is debounced -- don't fire on every pixel of a drag-resize.
+let resizeTimer;
+function requestResize() {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(async () => {
+    const rect = viewport.getBoundingClientRect();
+    const width = Math.floor(rect.width);
+    const height = Math.floor(rect.height);
+    if (width < 100 || height < 100) return;
+    if (Math.abs(width - REMOTE_WIDTH) < 10 && Math.abs(height - REMOTE_HEIGHT) < 10) return;
+    const data = await post('/resize', { width, height });
+    if (data?.ok) {
+      REMOTE_WIDTH = data.width;
+      REMOTE_HEIGHT = data.height;
+    }
+  }, 400);
+}
+new ResizeObserver(requestResize).observe(viewport);
+requestResize();
+
+// The image always fills the container exactly (CSS width/height: 100%,
+// see #screen) once resize has matched the remote resolution to it -- map
+// click coordinates through the *current* rendered-box-to-remote-pixel
+// ratio regardless, so input stays correct during the brief window before
+// a resize has been applied.
+function remoteCoords(e) {
+  const rect = overlay.getBoundingClientRect();
+  const scaleX = REMOTE_WIDTH / rect.width;
+  const scaleY = REMOTE_HEIGHT / rect.height;
+  return {
+    x: Math.round((e.clientX - rect.left) * scaleX),
+    y: Math.round((e.clientY - rect.top) * scaleY),
+  };
+}
+
+let lastMove = 0;
+overlay.addEventListener('mousemove', (e) => {
+  const now = Date.now();
+  if (now - lastMove < 30) return;
+  lastMove = now;
+  const { x, y } = remoteCoords(e);
+  post('/input/mouse', { type: 'move', x, y });
+});
+overlay.addEventListener('mousedown', (e) => {
+  e.preventDefault();
+  viewport.focus();
+  const { x, y } = remoteCoords(e);
+  post('/input/mouse', { type: 'down', x, y, button: e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left' });
+});
+overlay.addEventListener('mouseup', (e) => {
+  e.preventDefault();
+  const { x, y } = remoteCoords(e);
+  post('/input/mouse', { type: 'up', x, y, button: e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left' });
+});
+overlay.addEventListener('contextmenu', (e) => e.preventDefault());
+overlay.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  post('/input/mouse', { type: 'wheel', deltaX: e.deltaX, deltaY: e.deltaY });
+}, { passive: false });
+
+const NAMED_KEYS = new Set([
+  'Enter', 'Backspace', 'Tab', 'Escape', 'Delete', 'Home', 'End',
+  'PageUp', 'PageDown', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+  'Insert', 'F1','F2','F3','F4','F5','F6','F7','F8','F9','F10','F11','F12',
+]);
+viewport.addEventListener('keydown', (e) => {
+  e.preventDefault();
+  const mods = [];
+  if (e.ctrlKey) mods.push('Control');
+  if (e.metaKey) mods.push('Meta');
+  if (e.altKey) mods.push('Alt');
+  if (e.shiftKey && (mods.length || NAMED_KEYS.has(e.key))) mods.push('Shift');
+
+  if (mods.length > 0) {
+    const keyName = e.key.length === 1 ? e.key.toUpperCase() : e.key;
+    post('/input/key', { action: 'press', key: [...mods, keyName].join('+') });
+    return;
+  }
+  if (NAMED_KEYS.has(e.key)) {
+    post('/input/key', { action: 'press', key: e.key });
+    return;
+  }
+  if (e.key.length === 1) {
+    post('/input/key', { action: 'type', text: e.key });
+  }
+});
+
+async function pollFiles() {
+  try {
+    const res = await fetch('/files');
+    const list = await res.json();
+    filesList.innerHTML = list.length
+      ? list.map((f) => `<div class="row"><a href="/files/${encodeURIComponent(f.name)}" download>${f.name}</a></div>`).join('')
+      : '<div class="empty">Keine Dateien</div>';
+  } catch {}
+  setTimeout(pollFiles, 3000);
+}
+pollFiles();
+
+filesBtn.addEventListener('click', () => filesPanel.classList.toggle('open'));
+uploadInput.addEventListener('change', async () => {
+  const file = uploadInput.files[0];
+  if (!file) return;
+  const form = new FormData();
+  form.append('file', file);
+  await fetch('/files', { method: 'POST', body: form });
+  uploadInput.value = '';
+});
+
+viewport.focus();
+</script>
+</body>
+</html>
