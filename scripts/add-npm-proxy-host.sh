@@ -51,7 +51,8 @@ curl -sf -X POST "$NPM_URL/api/nginx/proxy-hosts" \
     \"ssl_forced\": false,
     \"block_exploits\": true,
     \"caching_enabled\": false,
-    \"allow_websocket_upgrade\": false
+    \"allow_websocket_upgrade\": false,
+    \"enabled\": true
   }"
 
 echo
