@@ -13,6 +13,13 @@
 # GET /audio) and one virtual input source ("virtmic", a named-pipe source
 # Chrome/Discord see as the default microphone -- POST /audio/mic streams a
 # client's real mic, transcoded by ffmpeg, into that pipe).
+#
+# This is a full desktop, not just a Chrome kiosk -- Discord and a plain
+# xterm are installed too, launched on demand via POST /apps/launch (see the
+# launcher buttons in static/index.html), since there's no window manager
+# taskbar/start-menu UI exposed through the relay to launch arbitrary apps
+# any other way (Chrome fills the whole screen at all times, so there's no
+# visible desktop background to right-click for Fluxbox's own root menu).
 FROM node:22-bookworm
 
 # intel-media-va-driver-non-free (VA-API driver for Iris Xe/Alder Lake+) lives
@@ -26,6 +33,13 @@ RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
       sed -i 's/^deb \(.*\) bookworm main$/deb \1 bookworm main contrib non-free non-free-firmware/' /etc/apt/sources.list; \
     fi
 
+# zenity is here specifically for Discord (see the wget/install below), not
+# for anything of our own: Discord's launcher (/usr/bin/discord) is a
+# bootstrapper that downloads the real app on first run and invokes itself
+# with `--zenity` to show a GTK progress dialog during that download --
+# without zenity actually installed, this hangs indefinitely instead of
+# failing or skipping the dialog (repro'd: the bootstrap process sat alive
+# at ~0% CPU for minutes, never progressing, no error of any kind).
 RUN apt-get update && apt-get install -y --no-install-recommends \
       xvfb \
       fluxbox \
@@ -47,9 +61,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       pulseaudio \
       pulseaudio-utils \
       locales \
+      xterm \
+      zenity \
     && wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
     && apt-get install -y --no-install-recommends /tmp/chrome.deb \
     && rm /tmp/chrome.deb \
+    && wget -q -O /tmp/discord.deb "https://discord.com/api/download?platform=linux&format=deb" \
+    && apt-get install -y --no-install-recommends /tmp/discord.deb \
+    && rm /tmp/discord.deb \
     && rm -rf /var/lib/apt/lists/*
 
 # No locale is configured at all by default in this base image (bare "C"),

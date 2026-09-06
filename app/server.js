@@ -415,16 +415,24 @@ async function seedFluxboxInit() {
 // Fluxbox draws its own title bar above every window by default. With
 // Chrome positioned at (0,0) filling the whole Xvfb screen, that decoration
 // has nowhere to go but off the top edge of the screen -- it's the "cut off
-// head" at the top of the captured video. There's exactly one window that
-// ever exists in this desktop (Chrome), so removing decorations for it
-// entirely is correct, not just a workaround -- also reclaims that strip of
-// screen space for actual content. Same as seedFluxboxInit, this file isn't
-// on the persistent volume and must be rewritten every container start.
+// head" at the top of the captured video. Same treatment for Discord, since
+// it's launched full-screen the same way (see /apps/launch) -- an xterm
+// launched via the same route deliberately keeps its title bar/border,
+// since it's meant to be a small movable/resizable window alongside
+// whatever else is open, not a fullscreen app. Same as seedFluxboxInit,
+// this file isn't on the persistent volume and must be rewritten every
+// container start.
 async function seedFluxboxApps() {
   const fluxboxDir = path.join(process.env.HOME || "/root", ".fluxbox");
   await fsp.mkdir(fluxboxDir, { recursive: true });
   const appsPath = path.join(fluxboxDir, "apps");
-  await fsp.writeFile(appsPath, "[app] (class=Google-chrome)\n [Deco]\t{NONE}\n[end]\n");
+  await fsp.writeFile(
+    appsPath,
+    // WM_CLASS is case-sensitive here and NOT what the binary/package name
+    // would suggest -- confirmed via `xprop WM_CLASS` against a real running
+    // window: Discord's is "Discord" (capital), not "discord".
+    "[app] (class=Google-chrome)\n [Deco]\t{NONE}\n[end]\n" + "[app] (class=Discord)\n [Deco]\t{NONE}\n[end]\n"
+  );
 }
 
 // PulseAudio in --system mode (not a per-user session daemon) since
@@ -601,6 +609,81 @@ app.post("/audio/mic", (req, res) => {
   proc.on("exit", () => {
     if (micFfmpegProc === proc) micFfmpegProc = null;
   });
+});
+
+// On-demand app launching -- see the Dockerfile's header comment for why
+// this exists at all (no reachable taskbar/root-menu UI to launch arbitrary
+// apps otherwise, since Chrome fills the whole screen). Not tracked/
+// singleton server-side: Discord enforces single-instance itself, and
+// multiple terminals is a completely normal thing to want.
+// Discord is Electron-based, same as Chrome, and has the identical hard
+// requirement: it refuses outright to run as root without --no-sandbox
+// ("Running as root without --no-sandbox is not supported", a FATAL crash,
+// not a warning) -- unrelated to any container-specific sandboxing, this is
+// Electron's own root check.
+//
+// Discord's launcher script is a bootstrapper, not the app itself -- first
+// run downloads the real app from Discord's update servers into
+// $HOME/.config/discord (confirmed: "Install Complete / Bootstrap complete"
+// on first launch, ~20s+ depending on network, before the actual Electron
+// process even starts). Tried pointing that at a directory under DATA_DIR
+// instead, to persist it across container recreates like the Chrome
+// profile -- caused Discord to hang forever on its own splash screen on the
+// next launch after a recreate (repro'd twice; likely some cached
+// machine/session identity mismatch the updater doesn't handle gracefully).
+// Not worth chasing further: the plain default is completely reliable, just
+// pays the ~20s bootstrap cost once per container lifetime (not once per
+// launch -- it's cached in that container's $HOME for as long as it stays
+// running, only a full recreate loses it) rather than never.
+const LAUNCHABLE_APPS = {
+  discord: { command: "discord", args: ["--no-sandbox"], env: {} },
+  terminal: { command: "xterm", args: [], env: {} },
+};
+
+app.post("/apps/launch", (req, res) => {
+  const app_ = LAUNCHABLE_APPS[req.body?.app];
+  if (!app_) return res.status(400).json({ error: "unknown app" });
+
+  const proc = spawn(app_.command, app_.args, { env: { ...childEnv, ...app_.env }, stdio: "ignore", detached: true });
+  proc.unref();
+  proc.on("error", (e) => console.error(`[launch:${req.body.app}] failed to start: ${e.message}`));
+
+  if (req.body.app === "discord") {
+    // Discord (Electron) doesn't take Chrome-style --window-position/
+    // --window-size flags, so it doesn't start filling the screen the way
+    // Chrome does -- size/move it the same way a manual resize would
+    // (resizeDisplay), just targeted by window class instead of "whatever's
+    // currently focused" since it isn't focused yet right after spawning.
+    // Polls rather than a single fixed delay: first-ever launch (the
+    // bootstrap download above) can take 20s+, but once cached on the
+    // volume, the real window usually appears within 1-2s -- a single
+    // timeout can't fit both without either being needlessly slow every
+    // time or missing the window entirely on a cold first run.
+    const deadline = Date.now() + 45000;
+    const tryResize = async () => {
+      try {
+        // --onlyvisible: Discord's WM_CLASS is shared by more than just the
+        // main window (helper/overlay windows match too) -- resizing the
+        // wrong one silently leaves the actually-visible window untouched.
+        const out = await execFilePromise("xdotool", ["search", "--onlyvisible", "--class", "Discord"]);
+        const ids = out.trim().split("\n").filter(Boolean);
+        if (ids.length > 0) {
+          for (const id of ids) {
+            await xdotool(["windowsize", id, String(DISPLAY_WIDTH), String(DISPLAY_HEIGHT)]);
+            await xdotool(["windowmove", id, "0", "0"]);
+          }
+          await xdotool(["windowactivate", ids[ids.length - 1]]);
+          return;
+        }
+      } catch {
+        // no window yet -- expected while discord is still bootstrapping/starting
+      }
+      if (Date.now() < deadline) setTimeout(tryResize, 2000);
+    };
+    setTimeout(tryResize, 2000);
+  }
+
+  res.json({ ok: true });
 });
 
 const NAMED_KEY_TO_XDOTOOL = {

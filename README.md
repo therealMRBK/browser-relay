@@ -15,6 +15,9 @@ browser, no automation-detection cat-and-mouse.
 - Full remote desktop (not just one browser tab) — any app you install
   inside the container is visible and controllable
 - Real Chrome, never CDP/automation-driven
+- **Discord and a terminal (xterm) come pre-installed**, launched on demand
+  via the 🎮/⌨️ buttons in the corner of the page — see
+  [Launching Discord/a terminal](#launching-discordaterminal) below
 - Live desktop stream via `ffmpeg -f x11grab` → MJPEG, `multipart/x-mixed-replace`
 - **Bidirectional audio**, also over plain HTTP: hear the remote desktop's
   sound (Chrome's audio → live Ogg/Opus stream), and send your own
@@ -74,6 +77,32 @@ video decode (see `docker-compose.yml`'s `devices:` block) needs a host with
 `/dev/dri` — remove that block if your host doesn't have one, Chrome falls
 back to software decode automatically.
 
+## Launching Discord/a terminal
+
+There's no reachable taskbar or desktop right-click menu to launch other
+apps from (Chrome fills the whole screen at all times), so Discord and
+`xterm` are started via the two extra buttons in the top-right corner
+instead (`POST /apps/launch`, body `{"app": "discord"}` or `{"app":
+"terminal"}` — same mechanism if you ever want to add another app the same
+way).
+
+**First Discord launch takes 20-60+ seconds**: `/usr/bin/discord` is only a
+bootstrapper, not the app itself — it downloads the real client from
+Discord's update servers the first time, on every fresh container (this
+isn't cached across container recreates, only within one container's
+uptime). You may see a couple of small "profile in use?" dialog boxes pop up
+during that first launch — they're leftover/informational from Discord's own
+updater, not something blocking; the login screen behind them works
+regardless, and you can close or ignore them. The window is auto-resized to
+fill the screen once it appears, but keeps its normal title bar (unlike
+Chrome, which is borderless) — drag it or use the maximize button if the
+automatic sizing doesn't land right.
+
+`xterm` opens as a normal, decorated, resizable window and gives you a real
+root shell in the container (e.g. to poke around, install something else
+ad-hoc, or check logs) — clicking the button again opens another one, there's
+no limit.
+
 ## Updating an existing install
 
 ```bash
@@ -109,8 +138,9 @@ docker compose up -d --build
 
 **This app has no built-in authentication or login screen.** Anyone who can
 reach the exposed port gets a full, controllable desktop with internet
-access, can listen to its audio, and can inject audio into its virtual
-microphone. Do not expose it directly to the internet.
+access, can listen to its audio, can inject audio into its virtual
+microphone, **and can open a root shell in the container via the terminal
+button**. Do not expose it directly to the internet.
 
 Put it behind an authenticating reverse proxy (e.g. nginx/Caddy with Basic
 Auth or an access list) or a VPN before making it reachable from outside
@@ -149,7 +179,7 @@ your own machine or LAN.
 
 ## Tech stack
 
-Node.js 22 · Express · Xvfb · Fluxbox · ffmpeg · xdotool · PulseAudio · Google Chrome
+Node.js 22 · Express · Xvfb · Fluxbox · ffmpeg · xdotool · PulseAudio · Google Chrome · Discord · xterm
 
 ## License
 
