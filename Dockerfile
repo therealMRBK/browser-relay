@@ -5,7 +5,26 @@
 # app (not via Playwright/CDP), so it is never automation-flagged: the
 # Chrome Web Store, extensions, and everything else behaves exactly like a
 # real user's browser, unlike a CDP-driven instance.
+#
+# Audio is bidirectional, both over plain HTTP (no WebSockets here either):
+# PulseAudio (--system mode, see seedPulseSystemConfig in server.js) provides
+# one virtual output sink ("chrome_out", Chrome's default audio device --
+# its monitor is captured by ffmpeg and served as a live Ogg/Opus stream at
+# GET /audio) and one virtual input source ("virtmic", a named-pipe source
+# Chrome/Discord see as the default microphone -- POST /audio/mic streams a
+# client's real mic, transcoded by ffmpeg, into that pipe).
 FROM node:22-bookworm
+
+# intel-media-va-driver-non-free (VA-API driver for Iris Xe/Alder Lake+) lives
+# in Debian's non-free component, not enabled by default in this base image.
+# Patch the existing sources file rather than adding a new one -- this image
+# uses the newer DEB822 format (debian.sources), and a duplicate classic
+# sources.list entry for the same repo conflicts on Signed-By.
+RUN if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+      sed -i 's/^Components: main$/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources; \
+    else \
+      sed -i 's/^deb \(.*\) bookworm main$/deb \1 bookworm main contrib non-free non-free-firmware/' /etc/apt/sources.list; \
+    fi
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       xvfb \
@@ -21,10 +40,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       gnupg \
       ca-certificates \
       fonts-liberation \
+      mesa-va-drivers \
+      libgl1-mesa-dri \
+      intel-media-va-driver-non-free \
+      vainfo \
+      pulseaudio \
+      pulseaudio-utils \
+      locales \
     && wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
     && apt-get install -y --no-install-recommends /tmp/chrome.deb \
     && rm /tmp/chrome.deb \
     && rm -rf /var/lib/apt/lists/*
+
+# No locale is configured at all by default in this base image (bare "C"),
+# which breaks more than just display: xdotool's `type` command decodes its
+# argument via the process locale, and under "C" it can't parse any
+# multi-byte UTF-8 sequence at all -- typing anything outside plain ASCII
+# (e.g. umlauts: ä/ö/ü) fails outright with "Invalid multi-byte sequence
+# encountered", not just displays wrong. de_DE.UTF-8 fixes that AND gives
+# Chrome (via LANG/LC_ALL/LANGUAGE in server.js's childEnv, plus --lang=de)
+# a German UI by default.
+RUN localedef -i de_DE -c -f UTF-8 -A /usr/share/locale/locale.alias de_DE.UTF-8
 
 # fluxbox's default style references a background image via fbsetbg, which
 # this minimal image's ImageMagick build can't actually apply (fails

@@ -21,12 +21,16 @@
   #viewport { position: absolute; inset: 0; outline: none; }
   #screen { display: block; width: 100%; height: 100%; background: #000; }
   #overlay { position: absolute; top: 0; left: 0; right: 0; bottom: 0; cursor: default; }
-  #filesBtn {
-    position: absolute; top: 8px; right: 8px; z-index: 21;
+  #filesBtn, #soundBtn, #micBtn {
+    position: absolute; top: 8px; z-index: 21;
     background: rgba(42,42,42,0.75); color: #eee; border: 1px solid rgba(74,74,74,0.8); border-radius: 6px;
     padding: 4px 10px; cursor: pointer; font-size: 0.8rem; backdrop-filter: blur(2px);
   }
-  #filesBtn:hover { background: rgba(69,69,69,0.9); }
+  #filesBtn:hover, #soundBtn:hover, #micBtn:hover { background: rgba(69,69,69,0.9); }
+  #filesBtn { right: 8px; }
+  #soundBtn { right: 44px; }
+  #micBtn { right: 80px; }
+  #soundBtn.active, #micBtn.active { background: rgba(74,124,74,0.85); border-color: rgba(120,180,120,0.8); }
   .panel {
     position: absolute; top: 44px; right: 8px; width: 320px; max-height: 60vh; overflow-y: auto;
     background: #2a2a2a; border: 1px solid #4a4a4a; border-radius: 8px; padding: 10px;
@@ -47,6 +51,9 @@
     <div id="overlay"></div>
   </div>
   <button id="filesBtn">📁</button>
+  <button id="micBtn" title="Mikrofon an dieses Gerät senden">🎤</button>
+  <button id="soundBtn" title="Ton dieses Geräts anhören">🔊</button>
+  <audio id="remoteAudio" preload="none"></audio>
   <div class="panel" id="filesPanel">
     <div id="filesList"></div>
     <div class="upload-row">
@@ -184,6 +191,72 @@ async function pollFiles() {
 pollFiles();
 
 filesBtn.addEventListener('click', () => filesPanel.classList.toggle('open'));
+
+// --- Audio out: the remote desktop's sound, played back here. A plain
+// <audio> element pointed at GET /audio (a live Ogg/Opus stream, see
+// server.js) -- no WebSocket, no WebRTC, just a long-lived HTTP response
+// the browser decodes incrementally like any other streamed audio file.
+// Autoplay-with-sound needs a user gesture first, which this button click
+// itself satisfies. ---
+const soundBtn = document.getElementById('soundBtn');
+const remoteAudio = document.getElementById('remoteAudio');
+let soundOn = false;
+soundBtn.addEventListener('click', () => {
+  soundOn = !soundOn;
+  soundBtn.classList.toggle('active', soundOn);
+  if (soundOn) {
+    remoteAudio.src = '/audio?' + Date.now(); // cache-bust so a re-enable doesn't reuse a stalled connection
+    remoteAudio.play().catch((e) => console.error('audio play failed', e));
+  } else {
+    remoteAudio.pause();
+    remoteAudio.removeAttribute('src');
+    remoteAudio.load();
+  }
+});
+
+// --- Audio in: this device's real microphone, sent to the remote desktop's
+// virtual microphone (see POST /audio/mic in server.js). One continuous
+// MediaRecorder session feeds a ReadableStream used as a genuinely
+// long-lived streaming fetch request body -- not repeated small POSTs,
+// since webm/opus chunks after the first aren't independently decodable.
+// Needs a browser that supports streaming request bodies (`duplex: "half"`
+// on fetch, e.g. Chrome/Edge 105+). ---
+const micBtn = document.getElementById('micBtn');
+let micStream = null;
+let micRecorder = null;
+micBtn.addEventListener('click', async () => {
+  if (micRecorder) {
+    micRecorder.stop();
+    micStream.getTracks().forEach((t) => t.stop());
+    micRecorder = null;
+    micStream = null;
+    micBtn.classList.remove('active');
+    return;
+  }
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    console.error('Mikrofonzugriff verweigert', e);
+    return;
+  }
+  micRecorder = new MediaRecorder(micStream, { mimeType: 'audio/webm;codecs=opus', audioBitsPerSecond: 64000 });
+  let controller;
+  const body = new ReadableStream({
+    start(c) { controller = c; },
+  });
+  micRecorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) {
+      e.data.arrayBuffer().then((buf) => {
+        try { controller.enqueue(new Uint8Array(buf)); } catch {}
+      });
+    }
+  };
+  micRecorder.onstop = () => { try { controller.close(); } catch {} };
+  fetch('/audio/mic', { method: 'POST', headers: { 'Content-Type': 'audio/webm' }, body, duplex: 'half' })
+    .catch((e) => console.error('mic stream failed', e));
+  micRecorder.start(250); // 250ms timeslice -- frequent enough for low latency, not so frequent it's mostly overhead
+  micBtn.classList.add('active');
+});
 uploadInput.addEventListener('change', async () => {
   const file = uploadInput.files[0];
   if (!file) return;

@@ -31,8 +31,32 @@ let DISPLAY_HEIGHT = parseInt(process.env.DISPLAY_HEIGHT || "900", 10);
 const TARGET_FPS = parseInt(process.env.TARGET_FPS || "12", 10);
 const DISPLAY = ":99";
 const MJPEG_BOUNDARY = "frame";
+const PULSE_SOCKET = "/var/run/pulse/native";
+// Deliberately NOT under /tmp: it's world-writable with the sticky bit set,
+// and the kernel's fs.protected_fifos hardening (on by default on modern
+// Debian) refuses to open a FIFO there when its owner doesn't match the
+// opening process's uid -- even for root. PulseAudio's pipe-source module
+// creates and owns this FIFO as the "pulse" system user, so ffmpeg (running
+// as root) got a flat "Permission denied" trying to open it under /tmp.
+// A root-owned, non-world-writable directory sidesteps the restriction
+// entirely (it only applies to world-writable/sticky directories).
+const MIC_FIFO_DIR = "/run/desktop-relay";
+const MIC_FIFO_PATH = path.join(MIC_FIFO_DIR, "virtmic");
 
-const childEnv = { ...process.env, DISPLAY };
+const childEnv = {
+  ...process.env,
+  DISPLAY,
+  PULSE_SERVER: `unix:${PULSE_SOCKET}`,
+  // de_DE.UTF-8 fixes two unrelated things at once (see the Dockerfile's
+  // localedef comment): xdotool's `type` can't decode multi-byte UTF-8
+  // (umlauts, accents) at all under the default "C" locale, and this also
+  // gives Chrome a German UI by default (--lang=de below is the more
+  // direct/reliable way to set that, but LANG/LANGUAGE are still needed for
+  // xdotool and anything else that reads locale env vars).
+  LANG: "de_DE.UTF-8",
+  LC_ALL: "de_DE.UTF-8",
+  LANGUAGE: "de_DE:de",
+};
 
 function xdotool(args) {
   return new Promise((resolve, reject) => {
@@ -54,6 +78,15 @@ async function waitForX11Socket(timeoutMs = 15000) {
     await new Promise((r) => setTimeout(r, 200));
   }
   // The socket file can exist slightly before Xvfb accepts connections.
+  await new Promise((r) => setTimeout(r, 300));
+}
+
+async function waitForPulseSocket(timeoutMs = 15000) {
+  const start = Date.now();
+  while (!fssync.existsSync(PULSE_SOCKET)) {
+    if (Date.now() - start > timeoutMs) throw new Error("PulseAudio did not start in time");
+    await new Promise((r) => setTimeout(r, 200));
+  }
   await new Promise((r) => setTimeout(r, 300));
 }
 
@@ -213,6 +246,118 @@ function restartFfmpegCapture() {
   ffmpegProc.kill("SIGTERM");
 }
 
+// --- Audio out: Chrome's audio (default sink "chrome_out", see
+// seedPulseSystemConfig) captured live and served as Ogg/Opus over plain
+// HTTP -- GET /audio. Same principle as the video relay above (never
+// blindly forward a source byte stream to a client with no priming), but
+// the reframing unit here is an Ogg *page*, not an MJPEG part: any client
+// that starts receiving mid-stream without first getting the initial pages
+// (OpusHead + OpusTags) can't initialize its decoder at all, so those first
+// pages are cached and replayed to every new client before it joins the
+// live broadcast. Push-based broadcast (not the video relay's pull-based
+// per-client loop) is the right tradeoff here -- some client-side audio
+// buffering is normal/expected for a "listen along" stream, unlike the
+// video path's deliberate low-latency/no-backlog requirement for mouse
+// control responsiveness. ---
+
+const OGG_HEADER_PAGE_COUNT = 2; // OpusHead + OpusTags, always exactly 2 for a fresh Opus stream
+let oggHeaderPages = []; // cached raw bytes of the first 2 pages, replayed to every new listener
+let oggBuffer = Buffer.alloc(0);
+const audioListeners = new Set(); // Set<express.Response>
+// A listener connecting in the brief window before ffmpeg has produced its
+// first 2 pages yet would otherwise get an empty header replay and never
+// receive one at all (the live-broadcast branch below never sends header
+// pages to `audioListeners`) -- park them here instead, flushed the instant
+// headers complete.
+const pendingAudioListeners = new Set();
+let audioFfmpegProc = null;
+
+function parseOggPages(chunk, onPage) {
+  oggBuffer = oggBuffer.length ? Buffer.concat([oggBuffer, chunk]) : chunk;
+  for (;;) {
+    if (oggBuffer.length < 27) return; // minimum fixed Ogg page header size
+    if (oggBuffer.toString("latin1", 0, 4) !== "OggS") {
+      // Should never happen with a well-formed ffmpeg ogg stream -- resync
+      // by scanning forward rather than getting stuck if it ever does.
+      const nextMagic = oggBuffer.indexOf("OggS", 1, "latin1");
+      if (nextMagic === -1) {
+        oggBuffer = Buffer.alloc(0);
+        return;
+      }
+      oggBuffer = oggBuffer.subarray(nextMagic);
+      continue;
+    }
+    const segmentCount = oggBuffer[26];
+    const headerLen = 27 + segmentCount;
+    if (oggBuffer.length < headerLen) return; // wait for the segment table itself
+    let payloadLen = 0;
+    for (let i = 0; i < segmentCount; i++) payloadLen += oggBuffer[27 + i];
+    const pageLen = headerLen + payloadLen;
+    if (oggBuffer.length < pageLen) return; // wait for the full payload
+    onPage(Buffer.from(oggBuffer.subarray(0, pageLen)));
+    oggBuffer = oggBuffer.subarray(pageLen);
+  }
+}
+
+function broadcastOggPage(page) {
+  if (oggHeaderPages.length < OGG_HEADER_PAGE_COUNT) {
+    oggHeaderPages.push(page);
+    if (oggHeaderPages.length === OGG_HEADER_PAGE_COUNT) {
+      for (const res of pendingAudioListeners) {
+        for (const headerPage of oggHeaderPages) res.write(headerPage);
+        audioListeners.add(res);
+      }
+      pendingAudioListeners.clear();
+    }
+    return; // header pages are sent to listeners as they join, not live-broadcast
+  }
+  for (const res of audioListeners) res.write(page);
+}
+
+function startAudioCapture() {
+  const args = [
+    "-loglevel", "error",
+    "-f", "pulse",
+    "-i", "chrome_out.monitor",
+    "-ac", "2",
+    "-ar", "48000",
+    "-c:a", "libopus",
+    "-b:a", "96k",
+    "-f", "ogg",
+    "pipe:1",
+  ];
+  const proc = spawn("ffmpeg", args, { env: childEnv, stdio: ["ignore", "pipe", "pipe"] });
+  proc.stdout.on("data", (chunk) => parseOggPages(chunk, broadcastOggPage));
+  proc.stderr.on("data", (d) => process.stderr.write(`[audio-ffmpeg] ${d}`));
+  proc.on("exit", (code, signal) => {
+    oggBuffer = Buffer.alloc(0);
+    oggHeaderPages = [];
+    console.error(`audio ffmpeg exited (code=${code}, signal=${signal}) -- restarting in 1s`);
+    setTimeout(startAudioCapture, 1000);
+  });
+  audioFfmpegProc = proc;
+}
+
+// --- Audio in: a client's real microphone, streamed here and transcoded
+// into the "virtmic" named-pipe source (see seedPulseSystemConfig) so
+// Chrome/Discord inside the container see it as their default microphone.
+// The client streams a live MediaRecorder(audio/webm;codecs=opus) session as
+// the POST body (a genuinely long-lived streaming request, not repeated
+// small POSTs -- webm chunks after the first aren't independently
+// decodable, they need the original stream's header) straight into ffmpeg's
+// stdin; ffmpeg writes raw PCM directly to the pipe path. Only one mic
+// session makes sense at a time (there's exactly one virtual microphone) --
+// a new POST simply takes over from whatever was streaming before. ---
+
+let micFfmpegProc = null;
+
+function stopMicCapture() {
+  if (micFfmpegProc) {
+    micFfmpegProc.kill("SIGTERM");
+    micFfmpegProc = null;
+  }
+}
+
 // Real xrandr resolution switching (not a client-side CSS scale) so the
 // remote desktop's actual pixels match the viewer's window -- crisp text,
 // no letterboxing. `cvt` computes a valid modeline for the target size;
@@ -282,11 +427,53 @@ async function seedFluxboxApps() {
   await fsp.writeFile(appsPath, "[app] (class=Google-chrome)\n [Deco]\t{NONE}\n[end]\n");
 }
 
+// PulseAudio in --system mode (not a per-user session daemon) since
+// everything in this container runs as root and there's no multi-user
+// desktop to isolate -- system mode is the one PulseAudio explicitly
+// supports running as root. Two virtual devices, no real sound hardware
+// needed at all: "chrome_out" is a null-sink Chrome's audio defaults to
+// (its .monitor is what ffmpeg captures for GET /audio), and "virtmic" is a
+// module-pipe-source backed by a named pipe at MIC_FIFO_PATH -- anything
+// written there (see the /audio/mic route's ffmpeg transcoder) shows up as
+// live microphone input. Both are set as defaults so Chrome/Discord pick
+// them up with no manual device selection. system.pa isn't on the
+// persistent volume, so, like the fluxbox config, this must be (re)written
+// every container start, not just once.
+async function seedPulseSystemConfig() {
+  const systemPaPath = "/etc/pulse/system.pa";
+  const config = [
+    "#!/usr/bin/pulseaudio -nF",
+    "load-module module-native-protocol-unix auth-anonymous=1",
+    "load-module module-null-sink sink_name=chrome_out sink_properties=device.description=ChromeOutput",
+    "set-default-sink chrome_out",
+    `load-module module-pipe-source source_name=virtmic file=${MIC_FIFO_PATH} format=s16le rate=48000 channels=2 source_properties=device.description=VirtualMicrophone`,
+    "set-default-source virtmic",
+    "",
+  ].join("\n");
+  await fsp.mkdir(path.dirname(systemPaPath), { recursive: true });
+  await fsp.writeFile(systemPaPath, config);
+  await fsp.mkdir(path.dirname(PULSE_SOCKET), { recursive: true }).catch(() => {});
+  // PulseAudio's module-pipe-source runs as the "pulse" system user (not
+  // root) and mkfifo()s this path itself -- needs the directory writable by
+  // that user, but NOT the sticky bit (0o755 caused a plain mkfifo
+  // "Permission denied" from pulseaudio itself; adding the sticky bit
+  // instead of avoiding it would just reintroduce the fs.protected_fifos
+  // issue this directory exists to sidestep in the first place). mkdir's
+  // own `mode` option is masked by the process umask, so chmod explicitly
+  // afterward to guarantee 0o777 regardless of umask.
+  await fsp.mkdir(MIC_FIFO_DIR, { recursive: true });
+  await fsp.chmod(MIC_FIFO_DIR, 0o777);
+}
+
 async function initDesktop() {
   await fsp.mkdir(PROFILE_DIR, { recursive: true });
   await fsp.mkdir(SHARED_DIR, { recursive: true });
   await fsp.mkdir(UPLOAD_TMP_DIR, { recursive: true });
   await seedChromePreferences();
+
+  await seedPulseSystemConfig();
+  spawnPersistent("pulseaudio", "pulseaudio", ["--system", "--disallow-exit", "--exit-idle-time=-1"]);
+  await waitForPulseSocket();
 
   spawnPersistent("Xvfb", "Xvfb", [DISPLAY, "-screen", "0", `${DISPLAY_WIDTH}x${DISPLAY_HEIGHT}x24`, "-nolisten", "tcp", "-ac"]);
   await waitForX11Socket();
@@ -298,18 +485,36 @@ async function initDesktop() {
 
   // No --enable-automation, no CDP, no remote-debugging-port -- a normal
   // Chrome launch, indistinguishable from a real user's browser.
+  //
+  // GPU flags below hand rendering to the passed-through iGPU (/dev/dri)
+  // instead of Chrome's software rasterizer (SwiftShader) -- Xvfb has no
+  // GPU of its own, so Chrome must be told explicitly to use the real
+  // device via EGL/Mesa rather than falling back to software. This only
+  // affects how Chrome renders internally; ffmpeg's x11grab capture of the
+  // resulting X11 framebuffer, and the MJPEG streaming pipeline, are
+  // unaffected either way.
   spawnPersistent("chrome", "google-chrome", [
     `--user-data-dir=${PROFILE_DIR}`,
     "--no-sandbox", // required running as root in a container; unrelated to automation flagging
     "--no-first-run",
     "--no-default-browser-check",
     "--password-store=basic",
+    "--lang=de",
     "--window-position=0,0",
     `--window-size=${DISPLAY_WIDTH},${DISPLAY_HEIGHT}`,
+    "--ignore-gpu-blocklist",
+    "--disable-gpu-sandbox",
+    "--use-gl=angle",
+    "--use-angle=gl",
+    "--enable-gpu-rasterization",
+    "--enable-zero-copy",
+    "--enable-native-gpu-memory-buffers",
+    "--enable-features=VaapiVideoDecoder,VaapiVideoEncoder",
     "about:blank",
   ]);
 
   startFfmpegCapture();
+  startAudioCapture();
 }
 
 const app = express();
@@ -346,6 +551,56 @@ app.get("/stream", (req, res) => {
     Pragma: "no-cache",
   });
   streamToClient(res);
+});
+
+// Live audio out (Chrome's sound) -- see the "Audio out" block above for the
+// header-priming rationale. Every new listener gets the cached OpusHead/
+// OpusTags pages first, then joins the live broadcast set.
+app.get("/audio", (req, res) => {
+  res.writeHead(200, {
+    "Content-Type": "audio/ogg",
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    Pragma: "no-cache",
+  });
+  if (oggHeaderPages.length === OGG_HEADER_PAGE_COUNT) {
+    for (const page of oggHeaderPages) res.write(page);
+    audioListeners.add(res);
+  } else {
+    pendingAudioListeners.add(res); // flushed by broadcastOggPage once headers complete
+  }
+  req.on("close", () => {
+    audioListeners.delete(res);
+    pendingAudioListeners.delete(res);
+  });
+});
+
+// Microphone in -- see the "Audio in" block above. Deliberately NOT behind
+// express.json() (that middleware only touches application/json bodies by
+// default, so this raw audio/webm body passes through untouched). The
+// request stays open for as long as the client keeps streaming; ffmpeg's
+// stdin ends (and the transcoder exits) when the client stops.
+app.post("/audio/mic", (req, res) => {
+  stopMicCapture();
+  const proc = spawn(
+    "ffmpeg",
+    ["-y", "-loglevel", "error", "-f", "webm", "-i", "pipe:0", "-ac", "2", "-ar", "48000", "-f", "s16le", MIC_FIFO_PATH],
+    { env: childEnv, stdio: ["pipe", "ignore", "pipe"] }
+  );
+  proc.stderr.on("data", (d) => process.stderr.write(`[mic-ffmpeg] ${d}`));
+  micFfmpegProc = proc;
+  // `.pipe()` ends proc.stdin (EOF) once req finishes -- that alone is
+  // enough for ffmpeg to flush whatever it's still decoding and exit on its
+  // own; don't SIGTERM it right when the request body ends, that killed it
+  // mid-flush and dropped nearly everything still buffered (caught via a
+  // real test: a throttled-but-finite upload only ever produced ~29 bytes
+  // of PCM out of an expected ~500KB+ until this was fixed).
+  req.pipe(proc.stdin);
+  req.on("close", () => {
+    if (!res.headersSent) res.json({ ok: true });
+  });
+  proc.on("exit", () => {
+    if (micFfmpegProc === proc) micFfmpegProc = null;
+  });
 });
 
 const NAMED_KEY_TO_XDOTOOL = {

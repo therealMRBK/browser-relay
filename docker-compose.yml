@@ -14,6 +14,13 @@ services:
     volumes:
       - desktop-relay-data:/data
     shm_size: "1gb"
+    # Passes the host's iGPU through for VAAPI hardware video decode (see
+    # server.js's Chrome launch flags) -- omit this block if the host has no
+    # /dev/dri (Chrome falls back to software decode/rendering either way,
+    # just slower). Not needed for the audio pipeline, only video.
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+      - /dev/dri/card0:/dev/dri/card0
 
 volumes:
   desktop-relay-data:

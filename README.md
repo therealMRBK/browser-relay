@@ -16,7 +16,13 @@ browser, no automation-detection cat-and-mouse.
   inside the container is visible and controllable
 - Real Chrome, never CDP/automation-driven
 - Live desktop stream via `ffmpeg -f x11grab` → MJPEG, `multipart/x-mixed-replace`
-- Mouse and keyboard control (`xdotool`)
+- **Bidirectional audio**, also over plain HTTP: hear the remote desktop's
+  sound (Chrome's audio → live Ogg/Opus stream), and send your own
+  microphone to it (it shows up inside the container as the default mic —
+  Discord, Meet, etc. just pick it up)
+- Mouse and keyboard control (`xdotool`), full Unicode input including
+  umlauts/accents (container locale is `de_DE.UTF-8`; Chrome's UI defaults
+  to German — see [Configuration](#configuration) to change either)
 - Dynamic resolution — the virtual display resizes to match your browser
   window automatically
 - Shared upload/download folder for file transfer with the remote desktop
@@ -52,14 +58,59 @@ All configuration is via `.env` — see [`.env.example`](.env.example):
 | `DISPLAY_WIDTH` / `DISPLAY_HEIGHT` | `1920` / `1080` | Initial virtual display resolution (auto-resizes per viewer) |
 | `TARGET_FPS` | `24` | Stream framerate |
 
+The container's locale and Chrome's UI language are set to German
+(`de_DE.UTF-8`, `--lang=de`) directly in the Dockerfile/`server.js` rather
+than via `.env` — change the `LANG`/`LC_ALL`/`LANGUAGE` values in
+`server.js`'s `childEnv` and the `--lang=de` Chrome flag if you want a
+different locale. This isn't just cosmetic: without *any* UTF-8 locale
+configured, `xdotool type` can't type multi-byte UTF-8 characters at all
+(umlauts, accents, emoji) and fails outright — it's not merely a display
+issue, so don't just drop this to fix "German by default" without picking
+another real UTF-8 locale to replace it with.
+
 Chrome's profile and the shared upload/download folder persist in the
-`desktop-relay-data` Docker volume.
+`desktop-relay-data` Docker volume. Optional GPU passthrough for hardware
+video decode (see `docker-compose.yml`'s `devices:` block) needs a host with
+`/dev/dri` — remove that block if your host doesn't have one, Chrome falls
+back to software decode automatically.
+
+## Updating an existing install
+
+```bash
+cd browser-relay
+git pull
+docker compose up -d --build
+```
+
+`up -d --build` rebuilds the image from the updated source and recreates
+the container automatically if anything changed — no separate `down`/`up`
+needed for ordinary code changes. Your Chrome profile, shared files, and
+`.env` are untouched (they live in the `desktop-relay-data` volume and your
+own `.env`, neither of which `git pull` or a rebuild touches).
+
+Two exceptions where you *do* need an extra step:
+- **`.env.example` gained a new variable you want to use**: `.env` isn't
+  auto-updated (it's your own file, `git` never touches it) — add the new
+  variable to your existing `.env` by hand, then `docker compose up -d --build`.
+- **`docker-compose.yml` itself changed** (e.g. this update added the
+  optional GPU `devices:` block): compare it against your local copy if
+  you've customized it — `git pull` will merge or conflict depending on
+  whether you've edited that specific file yourself.
+
+If something seems stuck after updating (e.g. still on the old image),
+force it explicitly:
+
+```bash
+docker compose down
+docker compose up -d --build
+```
 
 ## ⚠️ Security
 
 **This app has no built-in authentication or login screen.** Anyone who can
 reach the exposed port gets a full, controllable desktop with internet
-access. Do not expose it directly to the internet.
+access, can listen to its audio, and can inject audio into its virtual
+microphone. Do not expose it directly to the internet.
 
 Put it behind an authenticating reverse proxy (e.g. nginx/Caddy with Basic
 Auth or an access list) or a VPN before making it reachable from outside
@@ -84,10 +135,21 @@ your own machine or LAN.
 - **File transfer**: uploads land in a shared folder (`/data/shared`) that's
   also set as Chrome's default download directory, so any app's file-open
   dialog can see files from either direction.
+- **Audio out**: PulseAudio (`--system` mode) provides a virtual sink
+  (`chrome_out`) as Chrome's default audio device. Its monitor is captured
+  continuously by `ffmpeg` and encoded to Ogg/Opus; `GET /audio` serves that
+  as a live HTTP stream (the first two Ogg pages — the Opus header/tags —
+  are cached and replayed to every new listener first, since a stream
+  decoder can't initialize without them).
+- **Audio in**: a second virtual PulseAudio device (`virtmic`, a
+  `module-pipe-source` backed by a named pipe) is the container's default
+  microphone. `POST /audio/mic` accepts a live `MediaRecorder` (WebM/Opus)
+  stream as a genuinely long-lived streaming request body, transcodes it
+  with `ffmpeg`, and writes raw PCM straight into that pipe.
 
 ## Tech stack
 
-Node.js 22 · Express · Xvfb · Fluxbox · ffmpeg · xdotool · Google Chrome
+Node.js 22 · Express · Xvfb · Fluxbox · ffmpeg · xdotool · PulseAudio · Google Chrome
 
 ## License
 
