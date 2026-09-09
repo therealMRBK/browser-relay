@@ -155,7 +155,16 @@ your own machine or LAN.
 - **Streaming**: `ffmpeg -f x11grab` captures the X11 display and encodes it
   as an MJPEG stream (`-f mpjpeg`), which the server re-frames and relays to
   every connected client individually (pull-based — a slow client never
-  builds up a backlog, it just gets the newest frame available).
+  builds up a backlog, it just gets the newest frame available). The
+  frontend matters here too: it reads `/stream` itself via `fetch()` +
+  `ReadableStream` and draws to a `<canvas>`, always discarding any older
+  parsed-but-not-yet-rendered frame in favor of the newest one — deliberately
+  **not** a plain `<img src="/stream">`, since a browser's native
+  `multipart/x-mixed-replace` decoder must process every part strictly in
+  order with no way to skip ahead. Once that decode loop falls behind even
+  slightly (slow tab, GC pause), the backlog only ever grows for the life of
+  the connection — creeping, never-recovering latency that a page reload
+  "fixes" only by starting a fresh connection with an empty backlog.
 - **Input**: mouse/keyboard events from the browser are translated to
   `xdotool` commands against the virtual display — this controls the whole
   desktop, not just one page.
