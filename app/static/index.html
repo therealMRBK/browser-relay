@@ -47,7 +47,7 @@
 <body>
 <div class="viewport-wrap">
   <div id="viewport" tabindex="0">
-    <img id="screen" src="/stream" alt="Remote-Desktop">
+    <canvas id="screen" role="img" aria-label="Remote-Desktop"></canvas>
     <div id="overlay"></div>
   </div>
   <div id="btnRow">
@@ -81,6 +81,124 @@ const uploadInput = document.getElementById('uploadInput');
 
 let REMOTE_WIDTH = 1600, REMOTE_HEIGHT = 900;
 fetch('/info').then((r) => r.json()).then((d) => { REMOTE_WIDTH = d.width; REMOTE_HEIGHT = d.height; }).catch(() => {});
+
+// --- Video: a hand-rolled multipart/x-mixed-replace reader instead of a
+// plain <img src="/stream"> tag. The server side (server.js: streamToClient)
+// is deliberately pull-based -- it only ever has one frame in flight per
+// client and drops everything produced in between if a client falls behind.
+// A native <img> pointed at the same multipart stream throws that away: the
+// browser's own multipart decoder has to process every part strictly in
+// order with no way to skip ahead, so once its decode loop falls even
+// slightly behind the incoming byte rate (slow tab, GC pause, CPU spike),
+// the backlog can only ever grow for the lifetime of that connection --
+// visible as creeping/"ultra" latency that never recovers, exactly what a
+// full page reload (a fresh TCP connection with an empty backlog) fixes by
+// starting over. This reader applies the server's own frame-dropping
+// philosophy on the client too: it always keeps only the *latest* fully-
+// parsed frame and discards any older, not-yet-rendered ones outright, so a
+// slow render never accumulates a queue -- same tradeoff as the relay
+// itself (freshness over completeness), just extended one hop further.
+const screenCanvas = document.getElementById('screen');
+const screenCtx = screenCanvas.getContext('2d');
+
+function concatBytes(a, b) {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
+}
+
+// Mirrors server.js's own parseFfmpegChunk: pulls out complete
+// "Content-type: image/jpeg\r\nContent-length: N\r\n\r\n<N bytes>" parts.
+// Scans byte-by-byte for the header instead of decoding-then-searching a
+// string (this buffer holds binary JPEG data, not text -- a text decode
+// would corrupt/misinterpret it) -- cheap enough at MJPEG frame sizes and
+// this cadence.
+const HEADER_BYTES = new TextEncoder().encode('Content-type: image/jpeg\r\nContent-length: ');
+function findHeader(buf, from) {
+  outer: for (let i = from; i <= buf.length - HEADER_BYTES.length; i++) {
+    for (let j = 0; j < HEADER_BYTES.length; j++) {
+      if (buf[i + j] !== HEADER_BYTES[j]) continue outer;
+    }
+    return i;
+  }
+  return -1;
+}
+
+function extractFrames(buffer, onFrame) {
+  let searchFrom = 0;
+  for (;;) {
+    const headerStart = findHeader(buffer, searchFrom);
+    if (headerStart === -1) {
+      // No (start of a) header found -- keep only enough trailing bytes to
+      // still catch a header split across two network chunks next time.
+      const keepFrom = Math.max(0, buffer.length - HEADER_BYTES.length + 1);
+      return buffer.subarray(keepFrom);
+    }
+    // "\r\n\r\n" ends the two header lines; the digits between "Content-length: "
+    // and that marker are the JPEG byte count.
+    const lenStart = headerStart + HEADER_BYTES.length;
+    const headerTail = buffer.subarray(lenStart, lenStart + 20); // digits + \r\n\r\n fit comfortably
+    const tailStr = new TextDecoder().decode(headerTail);
+    const m = /^(\d+)\r\n\r\n/.exec(tailStr);
+    if (!m) {
+      // Digits/terminator not fully arrived yet -- wait for more data,
+      // resume the search from this same header next time.
+      return buffer.subarray(headerStart);
+    }
+    const jpegLen = parseInt(m[1], 10);
+    const jpegStart = lenStart + m[0].length;
+    const jpegEnd = jpegStart + jpegLen;
+    if (buffer.length < jpegEnd) return buffer.subarray(headerStart); // wait for the rest of this frame
+    onFrame(buffer.subarray(jpegStart, jpegEnd));
+    searchFrom = jpegEnd;
+  }
+}
+
+async function runVideoStream() {
+  let pendingFrame = null;
+  let rendering = false;
+
+  async function drainPending() {
+    if (rendering) return;
+    rendering = true;
+    while (pendingFrame) {
+      const frameBytes = pendingFrame;
+      pendingFrame = null; // if a newer frame lands mid-decode, it overwrites this and gets picked up on the next loop turn
+      try {
+        const bitmap = await createImageBitmap(new Blob([frameBytes], { type: 'image/jpeg' }));
+        if (screenCanvas.width !== bitmap.width) screenCanvas.width = bitmap.width;
+        if (screenCanvas.height !== bitmap.height) screenCanvas.height = bitmap.height;
+        screenCtx.drawImage(bitmap, 0, 0);
+        bitmap.close();
+      } catch {
+        // A truncated/corrupt frame decodes to nothing visible -- just skip it,
+        // the next frame (a few ms later) fixes the picture on its own.
+      }
+    }
+    rendering = false;
+  }
+
+  for (;;) {
+    try {
+      const res = await fetch('/stream');
+      const reader = res.body.getReader();
+      let buffer = new Uint8Array(0);
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer = extractFrames(concatBytes(buffer, value), (frame) => {
+          pendingFrame = frame;
+          drainPending();
+        });
+      }
+    } catch (e) {
+      console.error('video stream error, reconnecting', e);
+    }
+    await new Promise((r) => setTimeout(r, 500));
+  }
+}
+runVideoStream();
 
 async function post(path, body) {
   try {

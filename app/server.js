@@ -100,6 +100,26 @@ function spawnPersistent(name, command, args) {
   return proc;
 }
 
+// Chrome writes SingletonLock/-Socket/-Cookie into the profile dir to stop
+// two instances from sharing (and corrupting) one profile at once, keyed by
+// hostname+PID. That protection is meaningless here -- this container's
+// whole job is running exactly one Chrome against this profile at a time --
+// but the check itself doesn't know that: PROFILE_DIR lives on a volume that
+// outlives any single container, and every fresh container gets a new
+// random hostname (Docker's default), so Chrome sees "different computer,
+// lock still held" and refuses to start with a profile-in-use dialog on any
+// container *recreate* (not a plain restart of the same container, which
+// keeps the same hostname and lets Chrome's own graceful-shutdown handling
+// clean this up itself). Confirmed by reproducing it after a rebuild+
+// recreate cycle. Deleting these unconditionally before every launch is
+// safe precisely because there is never a second real instance to protect
+// against.
+async function clearStaleChromeLock() {
+  for (const name of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) {
+    await fsp.rm(path.join(PROFILE_DIR, name), { force: true }).catch(() => {});
+  }
+}
+
 // Chrome has no CLI flag for "default download directory" -- it's a
 // profile preference. Seeding it before first launch means downloads land
 // in SHARED_DIR without a save-dialog prompt, no CDP involved.
@@ -477,6 +497,7 @@ async function initDesktop() {
   await fsp.mkdir(PROFILE_DIR, { recursive: true });
   await fsp.mkdir(SHARED_DIR, { recursive: true });
   await fsp.mkdir(UPLOAD_TMP_DIR, { recursive: true });
+  await clearStaleChromeLock();
   await seedChromePreferences();
 
   await seedPulseSystemConfig();
