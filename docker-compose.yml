@@ -14,6 +14,16 @@ services:
     volumes:
       - desktop-relay-data:/data
     shm_size: "1gb"
+    # Plain `node server.js` as PID 1 never reaps orphaned grandchild
+    # processes (no init system does that for it) -- when Chrome's own
+    # top-level process dies (crash, OOM, a bad GPU/device passthrough), its
+    # already-running child processes (crashpad handlers, zygotes, renderers)
+    # get reparented to PID 1 and sit there as <defunct> zombies forever,
+    # since plain Node doesn't wait()/reap them. Confirmed hitting this for
+    # real: ~300 accumulated after a repeated Chrome crash loop. Docker's
+    # `--init` (tini as actual PID 1) fixes this structurally, for any future
+    # crash scenario, not just the one that surfaced it.
+    init: true
     # Passes the host's iGPU through for VAAPI hardware video decode (see
     # server.js's Chrome launch flags) -- omit this block if the host has no
     # /dev/dri (Chrome falls back to software decode/rendering either way,
