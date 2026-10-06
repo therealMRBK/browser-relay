@@ -90,14 +90,41 @@ async function waitForPulseSocket(timeoutMs = 15000) {
   await new Promise((r) => setTimeout(r, 300));
 }
 
-function spawnPersistent(name, command, args) {
+// Keeps a process running: restarts it whenever it exits. A process that keeps dying right away (something it needs is missing or
+// broken) is retried less and less often - 2 s, 4 s, 8 s ... up to 60 s - instead of every 2 s for ever: on 2026-10-02 a stale Xvfb
+// lock made Xvfb, fluxbox and Chrome fail every 2 s for four days, and every failed Chrome start left a 4 MB BrowserMetrics file in
+// the profile until the host's disk was full. One that ran for a minute or more starts over at 2 s. `before` (sync) runs before
+// every start - the place to clear whatever a dead instance left behind.
+function spawnPersistent(name, command, args, before = null, delay = 1000) {
+  if (before) { try { before(); } catch (e) { console.error(`${name}: clean-up before start failed: ${e.message}`); } }
+  const started = Date.now();
   const proc = spawn(command, args, { env: childEnv, stdio: ["ignore", "pipe", "pipe"] });
   proc.on("exit", (code, signal) => {
-    console.error(`${name} exited (code=${code}, signal=${signal}) -- restarting in 2s`);
-    setTimeout(() => spawnPersistent(name, command, args), 2000);
+    const ran = Date.now() - started, next = ran >= 60000 ? 2000 : Math.min(60000, delay * 2);
+    console.error(`${name} exited (code=${code}, signal=${signal}) after ${Math.round(ran / 1000)}s -- restarting in ${next / 1000}s`);
+    setTimeout(() => spawnPersistent(name, command, args, before, next), next);
   });
   proc.stderr.on("data", (d) => process.stderr.write(`[${name}] ${d}`));
   return proc;
+}
+
+// Xvfb's lock (/tmp/.X99-lock, holding its PID) and socket outlive Xvfb itself when the container is stopped or the host goes down,
+// and /tmp is not cleared when the same container starts again. After the host reboot of 2026-10-02 the lock named PID 20 - by
+// then a different process - so every new Xvfb said "Server is already active for display 99" and quit, for days. Only this
+// server ever runs an Xvfb here, and it only starts one after the last one exited: whatever lock is there is stale.
+function clearStaleXvfbLock() {
+  for (const f of ["/tmp/.X99-lock", "/tmp/.X11-unix/X99"]) fssync.rmSync(f, { force: true });
+}
+
+// Chrome leaves a BrowserMetrics-*.pma file (about 4 MB of usage statistics, nothing else) for every start it does not shut down
+// cleanly. They piled up to 37 GB. Chrome is not running when this runs (before each start), so all of them can go.
+function clearChromeMetrics() {
+  const dir = path.join(PROFILE_DIR, "BrowserMetrics");
+  if (!fssync.existsSync(dir)) return;
+  for (const f of fssync.readdirSync(dir)) if (f.endsWith(".pma")) fssync.rmSync(path.join(dir, f), { force: true });
+}
+function clearStaleChromeLockSync() {
+  for (const name of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) fssync.rmSync(path.join(PROFILE_DIR, name), { force: true });
 }
 
 // Chrome writes SingletonLock/-Socket/-Cookie into the profile dir to stop
@@ -504,7 +531,7 @@ async function initDesktop() {
   spawnPersistent("pulseaudio", "pulseaudio", ["--system", "--disallow-exit", "--exit-idle-time=-1"]);
   await waitForPulseSocket();
 
-  spawnPersistent("Xvfb", "Xvfb", [DISPLAY, "-screen", "0", `${DISPLAY_WIDTH}x${DISPLAY_HEIGHT}x24`, "-nolisten", "tcp", "-ac"]);
+  spawnPersistent("Xvfb", "Xvfb", [DISPLAY, "-screen", "0", `${DISPLAY_WIDTH}x${DISPLAY_HEIGHT}x24`, "-nolisten", "tcp", "-ac"], clearStaleXvfbLock);
   await waitForX11Socket();
 
   await seedFluxboxInit();
@@ -540,7 +567,7 @@ async function initDesktop() {
     "--enable-native-gpu-memory-buffers",
     "--enable-features=VaapiVideoDecoder,VaapiVideoEncoder",
     "about:blank",
-  ]);
+  ], () => { clearStaleChromeLockSync(); clearChromeMetrics(); });
 
   startFfmpegCapture();
   startAudioCapture();
