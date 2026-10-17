@@ -52,6 +52,7 @@
   </div>
   <div id="btnRow">
     <button id="filesBtn">📁</button>
+    <button id="clipBtn" title="Zwischenablage: vom Desktop holen / an den Desktop senden">📋</button>
     <button id="micBtn" title="Mikrofon an dieses Gerät senden">🎤</button>
     <button id="soundBtn" title="Ton dieses Geräts anhören">🔊</button>
     <button id="discordBtn" title="Discord öffnen">🎮 Discord</button>
@@ -278,8 +279,39 @@ const NAMED_KEYS = new Set([
   'PageUp', 'PageDown', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
   'Insert', 'F1','F2','F3','F4','F5','F6','F7','F8','F9','F10','F11','F12',
 ]);
-viewport.addEventListener('keydown', (e) => {
+// --- Clipboard sync. Ctrl+V first copies this device's clipboard to the
+// remote one and only then sends the key; Ctrl+C / Ctrl+X pull the remote
+// clipboard back afterwards. The 📋 button does both directions on demand. ---
+async function pushClipboard() {
+  try {
+    const text = await navigator.clipboard.readText();
+    if (text) await post('/clipboard', { text });
+    return true;
+  } catch (e) { return false; }
+}
+async function pullClipboard() {
+  try {
+    const res = await fetch('/clipboard');
+    const { text } = await res.json();
+    if (text) await navigator.clipboard.writeText(text);
+    return !!text;
+  } catch (e) { return false; }
+}
+document.getElementById('clipBtn').addEventListener('click', async () => {
+  // local text wins when it differs from the remote one, otherwise take the remote
+  let remote = '';
+  try { remote = (await (await fetch('/clipboard')).json()).text || ''; } catch (e) {}
+  let local = '';
+  try { local = await navigator.clipboard.readText(); } catch (e) {}
+  if (local && local !== remote) await post('/clipboard', { text: local });
+  else if (remote) await navigator.clipboard.writeText(remote).catch(() => {});
+  viewport.focus();
+});
+
+viewport.addEventListener('keydown', async (e) => {
   e.preventDefault();
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'v' || e.key === 'V')) await pushClipboard();
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && ['c', 'C', 'x', 'X'].includes(e.key)) setTimeout(pullClipboard, 250);
   const mods = [];
   if (e.ctrlKey) mods.push('Control');
   if (e.metaKey) mods.push('Meta');

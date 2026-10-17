@@ -44,6 +44,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       xvfb \
       fluxbox \
       xdotool \
+      xclip \
       ffmpeg \
       x11-utils \
       x11-xserver-utils \

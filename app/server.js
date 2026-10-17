@@ -574,7 +574,7 @@ async function initDesktop() {
 }
 
 const app = express();
-app.use(express.json());
+app.use((req, res, next) => (req.path === "/clipboard" ? next() : express.json()(req, res, next)));
 const upload = multer({ dest: UPLOAD_TMP_DIR });
 
 app.get("/", (req, res) => {
@@ -849,6 +849,31 @@ app.post("/files", upload.single("file"), async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
   }
+});
+
+// --- Clipboard sync: the X CLIPBOARD selection of the remote desktop, read and
+// written as UTF-8 text so the client can mirror it with the browser's own
+// clipboard (see syncClipboard in static/index.html). ---
+
+app.get("/clipboard", async (req, res) => {
+  try {
+    const text = await execFilePromise("xclip", ["-selection", "clipboard", "-o"]).catch(() => "");
+    res.json({ text });
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+  }
+});
+
+app.post("/clipboard", express.json({ limit: "5mb" }), (req, res) => {
+  const text = typeof req.body?.text === "string" ? req.body.text : null;
+  if (text === null) return res.status(400).json({ error: "text fehlt" });
+  // xclip forks into the background as the selection owner and keeps its
+  // inherited pipes open, so stdout/stderr are not piped: answer when the
+  // foreground process exits instead of waiting for the pipes to close.
+  const child = spawn("xclip", ["-selection", "clipboard", "-i"], { env: childEnv, stdio: ["pipe", "ignore", "ignore"] });
+  child.on("error", (err) => res.status(500).json({ error: err.message }));
+  child.on("exit", (code) => (code === 0 ? res.json({ ok: true }) : res.status(500).json({ error: `xclip exit ${code}` })));
+  child.stdin.end(text, "utf8");
 });
 
 app.get("/healthz", (req, res) => res.send("ok"));
