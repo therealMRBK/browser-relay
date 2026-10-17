@@ -308,9 +308,30 @@ document.getElementById('clipBtn').addEventListener('click', async () => {
   viewport.focus();
 });
 
+// Automatic sync by polling (no WebSockets): once a second, while this tab has
+// focus, whichever side changed since the last round is copied to the other.
+// `synced` is the text both sides last agreed on, which stops ping-pong.
+let synced = null;
+async function autoSyncClipboard() {
+  if (!document.hasFocus()) return;
+  try {
+    const [local, remote] = await Promise.all([
+      navigator.clipboard.readText().catch(() => null),
+      fetch('/clipboard').then((r) => r.json()).then((d) => d.text || '').catch(() => null),
+    ]);
+    if (local === null || remote === null) return;
+    if (synced === null) { synced = local === remote ? local : remote; if (local === remote) return; }
+    if (local !== synced && local !== remote) { if (local) { await post('/clipboard', { text: local }); } synced = local; }
+    else if (remote !== synced && remote !== local) { if (remote) await navigator.clipboard.writeText(remote); synced = remote; }
+    else synced = local === remote ? local : synced;
+  } catch (e) {}
+}
+setInterval(autoSyncClipboard, 1000);
+window.addEventListener('focus', autoSyncClipboard);
+
 viewport.addEventListener('keydown', async (e) => {
   e.preventDefault();
-  if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'v' || e.key === 'V')) await pushClipboard();
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'v' || e.key === 'V')) { await pushClipboard(); await autoSyncClipboard(); }
   if ((e.ctrlKey || e.metaKey) && !e.altKey && ['c', 'C', 'x', 'X'].includes(e.key)) setTimeout(pullClipboard, 250);
   const mods = [];
   if (e.ctrlKey) mods.push('Control');
