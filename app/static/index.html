@@ -31,6 +31,10 @@
   }
   #btnRow button:hover { background: rgba(69,69,69,0.9); }
   #soundBtn.active, #micBtn.active { background: rgba(74,124,74,0.85); border-color: rgba(120,180,120,0.8); }
+  #stats {
+    position: absolute; bottom: 6px; right: 8px; z-index: 21; pointer-events: none;
+    font: 11px ui-monospace, monospace; color: rgba(238,238,238,0.55); background: rgba(0,0,0,0.35); padding: 2px 6px; border-radius: 4px;
+  }
   .panel {
     position: absolute; top: 44px; right: 8px; width: 320px; max-height: 60vh; overflow-y: auto;
     background: #2a2a2a; border: 1px solid #4a4a4a; border-radius: 8px; padding: 10px;
@@ -50,6 +54,7 @@
     <canvas id="screen" role="img" aria-label="Remote-Desktop"></canvas>
     <div id="overlay"></div>
   </div>
+  <div id="stats"></div>
   <div id="btnRow">
     <button id="filesBtn">📁</button>
     <button id="clipBtn" title="Zwischenablage: vom Desktop holen / an den Desktop senden">📋</button>
@@ -83,123 +88,182 @@ const uploadInput = document.getElementById('uploadInput');
 let REMOTE_WIDTH = 1600, REMOTE_HEIGHT = 900;
 fetch('/info').then((r) => r.json()).then((d) => { REMOTE_WIDTH = d.width; REMOTE_HEIGHT = d.height; }).catch(() => {});
 
-// --- Video: a hand-rolled multipart/x-mixed-replace reader instead of a
-// plain <img src="/stream"> tag. The server side (server.js: streamToClient)
-// is deliberately pull-based -- it only ever has one frame in flight per
-// client and drops everything produced in between if a client falls behind.
-// A native <img> pointed at the same multipart stream throws that away: the
-// browser's own multipart decoder has to process every part strictly in
-// order with no way to skip ahead, so once its decode loop falls even
-// slightly behind the incoming byte rate (slow tab, GC pause, CPU spike),
-// the backlog can only ever grow for the lifetime of that connection --
-// visible as creeping/"ultra" latency that never recovers, exactly what a
-// full page reload (a fresh TCP connection with an empty backlog) fixes by
-// starting over. This reader applies the server's own frame-dropping
-// philosophy on the client too: it always keeps only the *latest* fully-
-// parsed frame and discards any older, not-yet-rendered ones outright, so a
-// slow render never accumulates a queue -- same tradeoff as the relay
-// itself (freshness over completeness), just extended one hop further.
+// --- Video. The browser asks for frames one answer at a time (server.js: /video/h264, /video/jpeg) and only asks again
+// once it has drawn what it got, so at most one answer is ever on its way - nothing can pile up anywhere in between (the
+// old long multipart stream piled up in the reverse proxy whenever the line was slower than the stream, and the picture
+// fell seconds behind after a short while).
+//
+// H.264 decoded with WebCodecs is the default: 0.2-8 Mbit/s instead of ~36 for JPEG, and the server lowers the bitrate
+// when the line cannot keep up. WebCodecs needs a secure context (https) and a recent browser; without it, or after
+// repeated decoder errors, the page uses JPEG, which simply gets fewer frames per second on a slow line. ?mode=jpeg forces
+// JPEG.
 const screenCanvas = document.getElementById('screen');
 const screenCtx = screenCanvas.getContext('2d');
+const statsEl = document.getElementById('stats');
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-function concatBytes(a, b) {
-  const out = new Uint8Array(a.length + b.length);
-  out.set(a, 0);
-  out.set(b, a.length);
-  return out;
+let drawn = 0;
+let bytes = 0;
+let videoMode = '';
+function drawFrame(source, width, height) {
+  if (screenCanvas.width !== width) screenCanvas.width = width;
+  if (screenCanvas.height !== height) screenCanvas.height = height;
+  screenCtx.drawImage(source, 0, 0);
+  drawn++;
 }
+setInterval(() => {
+  statsEl.textContent = `${videoMode} · ${drawn} fps · ${((bytes * 8) / 1e6).toFixed(1)} Mbit/s`;
+  drawn = 0;
+  bytes = 0;
+}, 1000);
 
-// Mirrors server.js's own parseFfmpegChunk: pulls out complete
-// "Content-type: image/jpeg\r\nContent-length: N\r\n\r\n<N bytes>" parts.
-// Scans byte-by-byte for the header instead of decoding-then-searching a
-// string (this buffer holds binary JPEG data, not text -- a text decode
-// would corrupt/misinterpret it) -- cheap enough at MJPEG frame sizes and
-// this cadence.
-const HEADER_BYTES = new TextEncoder().encode('Content-type: image/jpeg\r\nContent-length: ');
-function findHeader(buf, from) {
-  outer: for (let i = from; i <= buf.length - HEADER_BYTES.length; i++) {
-    for (let j = 0; j < HEADER_BYTES.length; j++) {
-      if (buf[i + j] !== HEADER_BYTES[j]) continue outer;
-    }
-    return i;
-  }
-  return -1;
-}
-
-function extractFrames(buffer, onFrame) {
-  let searchFrom = 0;
-  for (;;) {
-    const headerStart = findHeader(buffer, searchFrom);
-    if (headerStart === -1) {
-      // No (start of a) header found -- keep only enough trailing bytes to
-      // still catch a header split across two network chunks next time.
-      const keepFrom = Math.max(0, buffer.length - HEADER_BYTES.length + 1);
-      return buffer.subarray(keepFrom);
-    }
-    // "\r\n\r\n" ends the two header lines; the digits between "Content-length: "
-    // and that marker are the JPEG byte count.
-    const lenStart = headerStart + HEADER_BYTES.length;
-    const headerTail = buffer.subarray(lenStart, lenStart + 20); // digits + \r\n\r\n fit comfortably
-    const tailStr = new TextDecoder().decode(headerTail);
-    const m = /^(\d+)\r\n\r\n/.exec(tailStr);
-    if (!m) {
-      // Digits/terminator not fully arrived yet -- wait for more data,
-      // resume the search from this same header next time.
-      return buffer.subarray(headerStart);
-    }
-    const jpegLen = parseInt(m[1], 10);
-    const jpegStart = lenStart + m[0].length;
-    const jpegEnd = jpegStart + jpegLen;
-    if (buffer.length < jpegEnd) return buffer.subarray(headerStart); // wait for the rest of this frame
-    onFrame(buffer.subarray(jpegStart, jpegEnd));
-    searchFrom = jpegEnd;
-  }
-}
-
-async function runVideoStream() {
-  let pendingFrame = null;
-  let rendering = false;
-
-  async function drainPending() {
-    if (rendering) return;
-    rendering = true;
-    while (pendingFrame) {
-      const frameBytes = pendingFrame;
-      pendingFrame = null; // if a newer frame lands mid-decode, it overwrites this and gets picked up on the next loop turn
-      try {
-        const bitmap = await createImageBitmap(new Blob([frameBytes], { type: 'image/jpeg' }));
-        if (screenCanvas.width !== bitmap.width) screenCanvas.width = bitmap.width;
-        if (screenCanvas.height !== bitmap.height) screenCanvas.height = bitmap.height;
-        screenCtx.drawImage(bitmap, 0, 0);
-        bitmap.close();
-      } catch {
-        // A truncated/corrupt frame decodes to nothing visible -- just skip it,
-        // the next frame (a few ms later) fixes the picture on its own.
-      }
-    }
-    rendering = false;
-  }
-
+async function runJpeg() {
+  videoMode = 'JPEG';
+  let after = 0;
   for (;;) {
     try {
-      const res = await fetch('/stream');
-      const reader = res.body.getReader();
-      let buffer = new Uint8Array(0);
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer = extractFrames(concatBytes(buffer, value), (frame) => {
-          pendingFrame = frame;
-          drainPending();
-        });
-      }
+      const res = await fetch(`/video/jpeg?after=${after}`, { cache: 'no-store' });
+      if (res.status === 204) continue;
+      if (!res.ok) { await sleep(1000); continue; }
+      after = parseInt(res.headers.get('X-Seq'), 10) || after;
+      const blob = await res.blob();
+      bytes += blob.size;
+      const bitmap = await createImageBitmap(blob);
+      drawFrame(bitmap, bitmap.width, bitmap.height);
+      bitmap.close();
     } catch (e) {
-      console.error('video stream error, reconnecting', e);
+      await sleep(1000);
     }
-    await new Promise((r) => setTimeout(r, 500));
   }
 }
-runVideoStream();
+
+// false: give up on H.264 and use JPEG
+async function runH264() {
+  videoMode = 'H.264';
+  let decoder = null;
+  let codec = null;
+  let epoch = -1;
+  let after = -1;
+  let failed = false;
+  let errors = 0;
+  const newDecoder = (c, width, height) => {
+    if (decoder && decoder.state !== 'closed') decoder.close();
+    failed = false;
+    decoder = new VideoDecoder({
+      output: (frame) => { drawFrame(frame, frame.displayWidth, frame.displayHeight); frame.close(); },
+      error: (e) => { console.error('decoder', e); failed = true; },
+    });
+    decoder.configure({ codec: c, codedWidth: width, codedHeight: height, optimizeForLatency: true });
+  };
+  for (;;) {
+    let res;
+    try {
+      res = await fetch(`/video/h264?after=${after}&epoch=${epoch}`, { cache: 'no-store' });
+    } catch (e) { await sleep(1000); continue; }
+    if (res.status === 204) continue;
+    if (!res.ok) { await sleep(1000); continue; }
+    const c = res.headers.get('X-Codec');
+    const e = parseInt(res.headers.get('X-Epoch'), 10);
+    const width = parseInt(res.headers.get('X-Width'), 10);
+    const height = parseInt(res.headers.get('X-Height'), 10);
+    const buf = new Uint8Array(await res.arrayBuffer());
+    bytes += buf.length;
+    const view = new DataView(buf.buffer);
+    const frames = [];
+    for (let at = 0; at + 9 <= buf.length;) {
+      const length = view.getUint32(at + 5);
+      frames.push({ seq: view.getUint32(at), key: buf[at + 4] === 1, data: buf.subarray(at + 9, at + 9 + length) });
+      at += 9 + length;
+    }
+    if (!frames.length) continue;
+    if (failed) {
+      errors++;
+      if (errors >= 3) return false;
+    }
+    const fresh = !decoder || failed || decoder.state === 'closed' || c !== codec || e !== epoch;
+    if (fresh) {
+      if (!frames[0].key) { after = -1; epoch = -1; continue; }
+      try {
+        const support = await VideoDecoder.isConfigSupported({ codec: c, codedWidth: width, codedHeight: height });
+        if (!support.supported) return false;
+        newDecoder(c, width, height);
+      } catch (err) { console.error(err); return false; }
+      codec = c;
+      epoch = e;
+    }
+    // a skip ahead (frames[0].seq > after + 1) needs nothing here: the keyframe it starts with resets the decoder, and the
+    // server lowers the bitrate when skips keep happening
+    videoMode = `H.264 ${res.headers.get('X-Bitrate') || ''}`;
+    for (const f of frames) {
+      try {
+        decoder.decode(new EncodedVideoChunk({ type: f.key ? 'key' : 'delta', timestamp: f.seq * 1000, data: f.data }));
+      } catch (err) { console.error(err); failed = true; break; }
+    }
+    after = frames[frames.length - 1].seq;
+    // never let the decoder build a queue either
+    while (decoder.decodeQueueSize > 2 && !failed) await sleep(5);
+  }
+}
+
+async function runVideo() {
+  const forceJpeg = new URLSearchParams(location.search).get('mode') === 'jpeg';
+  if (!forceJpeg && 'VideoDecoder' in window) {
+    const ok = await runH264().catch((e) => { console.error(e); return false; });
+    if (!ok) console.warn('H.264 not usable here, using JPEG');
+  }
+  await runJpeg();
+}
+runVideo();
+
+// --- The pointer is drawn by this browser itself, in the remote pointer's real shape (server.js: /cursor; the video
+// carries no pointer), so it moves without any delay. ---
+const cursorCanvas = document.createElement('canvas');
+async function runCursor() {
+  let after = 0;
+  for (;;) {
+    try {
+      const res = await fetch(`/cursor?after=${after}`, { cache: 'no-store' });
+      if (res.status === 204) continue;
+      if (!res.ok) { await sleep(2000); continue; }
+      const c = await res.json();
+      after = c.version;
+      if (!c.w || !c.h) { overlay.style.cursor = 'none'; continue; }
+      cursorCanvas.width = c.w;
+      cursorCanvas.height = c.h;
+      const pixels = new Uint8ClampedArray(c.w * c.h * 4);
+      for (let i = 0; i < pixels.length; i++) pixels[i] = parseInt(c.rgba.substr(i * 2, 2), 16);
+      cursorCanvas.getContext('2d').putImageData(new ImageData(pixels, c.w, c.h), 0, 0);
+      overlay.style.cursor = `url(${cursorCanvas.toDataURL()}) ${c.xhot} ${c.yhot}, default`;
+    } catch (e) {
+      await sleep(2000);
+    }
+  }
+}
+runCursor();
+
+// --- Input: one request in flight at a time, everything that happens meanwhile is collected and sent with the next one -
+// moves merged into the newest position, typed characters into one string, wheel steps added up. However slow the line,
+// input can never queue up: the remote pointer jumps straight to where the mouse is now. ---
+const inputQueue = [];
+let inputInFlight = false;
+function sendInput(ev) {
+  const last = inputQueue[inputQueue.length - 1];
+  if (last && last.t === ev.t && ev.t === 'move') Object.assign(last, ev);
+  else if (last && last.t === ev.t && ev.t === 'type') last.text += ev.text;
+  else if (last && last.t === ev.t && ev.t === 'wheel') { last.dx += ev.dx; last.dy += ev.dy; }
+  else inputQueue.push(ev);
+  flushInput();
+}
+async function flushInput() {
+  if (inputInFlight || !inputQueue.length) return;
+  inputInFlight = true;
+  const events = inputQueue.splice(0);
+  try {
+    await fetch('/input', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ events }) });
+  } catch (e) {}
+  inputInFlight = false;
+  flushInput();
+}
 
 async function post(path, body) {
   try {
@@ -249,29 +313,21 @@ function remoteCoords(e) {
   };
 }
 
-let lastMove = 0;
-overlay.addEventListener('mousemove', (e) => {
-  const now = Date.now();
-  if (now - lastMove < 30) return;
-  lastMove = now;
-  const { x, y } = remoteCoords(e);
-  post('/input/mouse', { type: 'move', x, y });
-});
+const buttonName = (e) => (e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left');
+overlay.addEventListener('mousemove', (e) => sendInput({ t: 'move', ...remoteCoords(e) }));
 overlay.addEventListener('mousedown', (e) => {
   e.preventDefault();
   viewport.focus();
-  const { x, y } = remoteCoords(e);
-  post('/input/mouse', { type: 'down', x, y, button: e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left' });
+  sendInput({ t: 'down', ...remoteCoords(e), b: buttonName(e) });
 });
 overlay.addEventListener('mouseup', (e) => {
   e.preventDefault();
-  const { x, y } = remoteCoords(e);
-  post('/input/mouse', { type: 'up', x, y, button: e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left' });
+  sendInput({ t: 'up', b: buttonName(e) });
 });
 overlay.addEventListener('contextmenu', (e) => e.preventDefault());
 overlay.addEventListener('wheel', (e) => {
   e.preventDefault();
-  post('/input/mouse', { type: 'wheel', deltaX: e.deltaX, deltaY: e.deltaY });
+  sendInput({ t: 'wheel', dx: e.deltaX, dy: e.deltaY });
 }, { passive: false });
 
 const NAMED_KEYS = new Set([
@@ -341,15 +397,15 @@ viewport.addEventListener('keydown', async (e) => {
 
   if (mods.length > 0) {
     const keyName = e.key.length === 1 ? e.key.toUpperCase() : e.key;
-    post('/input/key', { action: 'press', key: [...mods, keyName].join('+') });
+    sendInput({ t: 'key', key: [...mods, keyName].join('+') });
     return;
   }
   if (NAMED_KEYS.has(e.key)) {
-    post('/input/key', { action: 'press', key: e.key });
+    sendInput({ t: 'key', key: e.key });
     return;
   }
   if (e.key.length === 1) {
-    post('/input/key', { action: 'type', text: e.key });
+    sendInput({ t: 'type', text: e.key });
   }
 });
 

@@ -24,10 +24,10 @@ services:
     # `--init` (tini as actual PID 1) fixes this structurally, for any future
     # crash scenario, not just the one that surfaced it.
     init: true
-    # Passes the host's iGPU through for VAAPI hardware video decode (see
-    # server.js's Chrome launch flags) -- omit this block if the host has no
-    # /dev/dri (Chrome falls back to software decode/rendering either way,
-    # just slower). Not needed for the audio pipeline, only video.
+    # Passes the host's iGPU through: VAAPI H.264 encoding of the desktop video
+    # (server.js "Video" block) and hardware video decode in Chrome. Omit this
+    # block if the host has no /dev/dri: the encoder falls back to libx264 (CPU)
+    # and Chrome to software decode by themselves, just using more CPU.
     devices:
       - /dev/dri/renderD128:/dev/dri/renderD128
       - /dev/dri/card0:/dev/dri/card0

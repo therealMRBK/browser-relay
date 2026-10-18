@@ -1,5 +1,5 @@
 # desktop-relay: a full Linux desktop (Xvfb + Fluxbox + real Google Chrome)
-# streamed to the client as MJPEG over plain HTTP and controlled via plain
+# streamed to the client as H.264 (or JPEG) frames over plain HTTP and controlled via plain
 # HTTP POSTs -- deliberately zero WebSockets anywhere, for a network that
 # blocks the WS protocol outright. Chrome is launched as a normal desktop
 # app (not via Playwright/CDP), so it is never automation-flagged: the
@@ -20,6 +20,14 @@
 # taskbar/start-menu UI exposed through the relay to launch arbitrary apps
 # any other way (Chrome fills the whole screen at all times, so there's no
 # visible desktop background to right-click for Fluxbox's own root menu).
+# xhelper (app/xhelper.c): the long-running X client for mouse input and the pointer shape, built in its own stage so the
+# compiler and headers stay out of the final image.
+FROM debian:bookworm AS xhelper
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev libx11-dev libxtst-dev libxfixes-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY app/xhelper.c /src/xhelper.c
+RUN gcc -O2 -Wall -o /src/xhelper /src/xhelper.c -lX11 -lXtst -lXfixes
+
 FROM node:22-bookworm
 
 # intel-media-va-driver-non-free (VA-API driver for Iris Xe/Alder Lake+) lives
@@ -44,6 +52,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       xvfb \
       fluxbox \
       xdotool \
+      libxtst6 \
+      libxfixes3 \
       xclip \
       ffmpeg \
       x11-utils \
@@ -95,6 +105,7 @@ WORKDIR /app
 COPY app/package.json ./
 RUN npm install --omit=dev
 COPY app/ .
+COPY --from=xhelper /src/xhelper /app/xhelper
 
 ENV PORT=3000
 ENV DATA_DIR=/data

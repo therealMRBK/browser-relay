@@ -1,7 +1,7 @@
 # desktop-relay
 
 A full Linux desktop — Xvfb + Fluxbox + a real, normally-launched Google
-Chrome — streamed to any browser as MJPEG over plain HTTP and controlled
+Chrome — streamed to any browser as H.264 (or JPEG) over plain HTTP and controlled
 via plain HTTP POSTs. **No WebSockets anywhere**, deliberately: built for
 networks that block the WS protocol outright.
 
@@ -18,12 +18,15 @@ browser, no automation-detection cat-and-mouse.
 - **Discord and a terminal (xterm) come pre-installed**, launched on demand
   via the 🎮/⌨️ buttons in the corner of the page — see
   [Launching Discord/a terminal](#launching-discordaterminal) below
-- Live desktop stream via `ffmpeg -f x11grab` → MJPEG, `multipart/x-mixed-replace`
+- Live desktop via `ffmpeg -f x11grab` → H.264 (GPU-encoded via VAAPI, decoded in
+  the browser with WebCodecs, 0.2–8 Mbit/s, bitrate adapts to the line) or JPEG
+  as the fallback; latency stays constant however slow the connection
+- The mouse pointer is drawn locally in its real remote shape, so it never lags
 - **Bidirectional audio**, also over plain HTTP: hear the remote desktop's
   sound (Chrome's audio → live Ogg/Opus stream), and send your own
   microphone to it (it shows up inside the container as the default mic —
   Discord, Meet, etc. just pick it up)
-- Mouse and keyboard control (`xdotool`), full Unicode input including
+- Mouse and keyboard control (`xhelper`/XTest, `xdotool`), full Unicode input including
   umlauts/accents (container locale is `de_DE.UTF-8`; Chrome's UI defaults
   to German — see [Configuration](#configuration) to change either)
 - Dynamic resolution — the virtual display resizes to match your browser
@@ -59,7 +62,10 @@ All configuration is via `.env` — see [`.env.example`](.env.example):
 |---|---|---|
 | `HOST_PORT` | `8094` | Port the web UI is exposed on |
 | `DISPLAY_WIDTH` / `DISPLAY_HEIGHT` | `1920` / `1080` | Initial virtual display resolution (auto-resizes per viewer) |
-| `TARGET_FPS` | `24` | Stream framerate |
+| `TARGET_FPS` | `24` | Capture framerate |
+| `H264_BITRATE` / `H264_MAXRATE` | `3M` / `8M` | Top H.264 bitrate step (average / peak); lower steps are used automatically on slow lines |
+| `H264_ENCODER` | `vaapi` | `vaapi` (GPU) or `x264` (CPU); `vaapi` falls back to `x264` by itself if the GPU encoder fails |
+| `JPEG_QUALITY` | `7` | ffmpeg `-q:v` for the JPEG fallback (2 best … 31) |
 
 The container's locale and Chrome's UI language are set to German
 (`de_DE.UTF-8`, `--lang=de`) directly in the Dockerfile/`server.js` rather
@@ -152,22 +158,34 @@ your own machine or LAN.
   lightweight window manager on top of it.
 - **Browser**: real `google-chrome-stable`, launched as a normal process —
   no `--enable-automation`, no CDP.
-- **Streaming**: `ffmpeg -f x11grab` captures the X11 display and encodes it
-  as an MJPEG stream (`-f mpjpeg`), which the server re-frames and relays to
-  every connected client individually (pull-based — a slow client never
-  builds up a backlog, it just gets the newest frame available). The
-  frontend matters here too: it reads `/stream` itself via `fetch()` +
-  `ReadableStream` and draws to a `<canvas>`, always discarding any older
-  parsed-but-not-yet-rendered frame in favor of the newest one — deliberately
-  **not** a plain `<img src="/stream">`, since a browser's native
-  `multipart/x-mixed-replace` decoder must process every part strictly in
-  order with no way to skip ahead. Once that decode loop falls behind even
-  slightly (slow tab, GC pause), the backlog only ever grows for the life of
-  the connection — creeping, never-recovering latency that a page reload
-  "fixes" only by starting a fresh connection with an empty backlog.
-- **Input**: mouse/keyboard events from the browser are translated to
-  `xdotool` commands against the virtual display — this controls the whole
-  desktop, not just one page.
+- **Video**: `ffmpeg -f x11grab` captures the X11 display without the
+  pointer. Two pipelines, each started on the first request and stopped when
+  idle: H.264 (`h264_vaapi`, or `libx264` as a fallback) for browsers with
+  WebCodecs (needs https), and JPEG for everything else (a frame identical to
+  the previous one is not sent again, so a still screen costs nothing).
+  Delivery is **pull, one answer at a time**: the browser long-polls
+  `/video/h264?after=N` (or `/video/jpeg`), gets everything newer in one
+  answer and asks again only after it has decoded it. There is never more
+  than one answer in flight, so nothing can pile up anywhere in between — the
+  earlier design (one long `multipart/x-mixed-replace` stream) piled frames
+  up in a buffering reverse proxy whenever the line was slower than the
+  stream, and the picture fell seconds behind after a short while. A client
+  more than a second behind on H.264 skips to the newest keyframe (one every
+  second); when that keeps happening, the encoder restarts one bitrate step
+  lower (3 → 1.5 → 0.8 → 0.4 Mbit/s average) and tries a step higher again
+  after a quiet minute. Every response carries `X-Accel-Buffering: no`; for
+  nginx-based proxies also set `proxy_buffering off;` on the host.
+- **Pointer**: `xhelper` (`app/xhelper.c`, one long-running X client) reports
+  the pointer's shape via XFixes; the page draws it as a local CSS cursor, so
+  pointer movement has zero delay even when the picture lags.
+- **Input**: the page keeps a single `POST /input` in flight and collects
+  everything that happens meanwhile into the next batch (moves merged into
+  the newest position, typed characters into one string), so input can never
+  queue up behind a slow connection. Mouse events go to `xhelper` (XTest) —
+  a pipe write, not a process per event; keys go to `xdotool`. German
+  characters (ä ö ü ß € § ° µ ²) are mapped onto spare keycodes so
+  `xdotool type` doesn't have to remap keys on the fly (which lost about one
+  character in six).
 - **Resize**: dragging/resizing the browser window triggers a real `xrandr`
   mode switch (not CSS scaling) so the remote desktop always renders at the
   viewer's actual pixel size.

@@ -1,9 +1,10 @@
 /**
  * desktop-relay: a full Linux desktop (Xvfb + Fluxbox + a real, normally-
  * launched Google Chrome -- not driven via Playwright/CDP, so it is never
- * automation-flagged) streamed to the client as MJPEG over plain HTTP
- * (multipart/x-mixed-replace, produced by `ffmpeg -f x11grab`) and
- * controlled via plain HTTP POSTs (xdotool under the hood).
+ * automation-flagged) captured by `ffmpeg -f x11grab` and handed to the client
+ * as H.264 (WebCodecs) or JPEG frames over plain HTTP long polls (see the
+ * "Video" block), controlled via plain HTTP POSTs (xhelper.c for the mouse,
+ * xdotool for the keyboard).
  *
  * No WebSocket anywhere, deliberately: built for a network that blocks the
  * WS protocol outright. Because Chrome is launched like any other desktop
@@ -163,134 +164,343 @@ async function seedChromePreferences() {
   await fsp.writeFile(prefsPath, JSON.stringify(prefs));
 }
 
-let ffmpegProc = null;
-let lastFrame = null;
-let lastFrameSeq = 0; // bumped on every new frame; lets a client loop notice new work without polling a timer
+// --- Video. Two pipelines, each an ffmpeg capturing the X display, started when a client first asks for frames and stopped
+// again when nobody has asked for a while:
+//
+//   h264  H.264 for browsers with WebCodecs (GPU encoder via VAAPI, libx264 if that fails): about 1.5-6 Mbit/s.
+//   jpeg  one JPEG per frame for everything else; a frame identical to the last one is not counted as new, so a still screen
+//         costs nothing.
+//
+// Delivery is pull, one request per answer: the client asks for "anything after seq N", the server answers as soon as there
+// is something newer (or after FRAME_WAIT_MS with 204). There is never more than one answer in flight per client, whatever
+// sits in between. The old design streamed frames down one long response; behind a buffering reverse proxy (nginx reads the
+// upstream as fast as it can and spools to disk) every frame the client could not take in time piled up there, so the picture
+// fell further and further behind after a few seconds of use, until a reload.
+//
+// Neither pipeline draws the mouse pointer: the browser draws the real pointer shape itself (see /cursor), so it never lags.
+const FRAME_WAIT_MS = 15000;
+const PIPELINE_IDLE_MS = 15000;
+// a client further behind than this many H.264 frames skips ahead to the newest keyframe instead of catching up frame by frame
+const H264_MAX_LAG = TARGET_FPS;
+const H264_GOP = TARGET_FPS; // a keyframe every second: bounds how long a skip ahead can take
+// Bitrate steps (average / peak). A still screen needs about 0.2 Mbit/s at any step (a constant-bitrate setting filled even
+// that up to the full rate). When a client keeps having to skip ahead, its line is slower than the stream: the encoder
+// restarts one step lower. After a minute without skips it tries one step higher again.
+const H264_STEPS = [
+  [process.env.H264_BITRATE || "3M", process.env.H264_MAXRATE || "8M"],
+  ["1500k", "4M"],
+  ["800k", "2M"],
+  ["400k", "1M"],
+];
+const H264_STEP_UP_MS = 60000;
+const JPEG_QUALITY = process.env.JPEG_QUALITY || "7"; // ffmpeg -q:v, 2 (best) .. 31; was 5
 
-// Pull-based delivery, not push-based: each client runs its own loop that,
-// the instant it finishes flushing one frame to the OS, immediately looks
-// up whatever `lastFrame` is *right now* and sends that -- never a queued
-// backlog of intermediate frames. If ffmpeg produces frames faster than a
-// client can consume them, the frames produced in between are simply never
-// sent to that client (dropped), same as how a live UDP stream behaves
-// with no retransmission/buffering. This replaces an earlier design that
-// pushed every frame reactively and skipped writes only when already
-// backed up (`res.writableNeedDrain`) -- structurally similar in intent,
-// but reactive-push still allows one frame to queue up per production tick
-// during the round-trip before the flag reflects reality, and does nothing
-// to bound *ffmpeg's own* internal encode latency if the host is CPU/memory
-// constrained. Pull-based delivery at least guarantees this relay is never
-// the thing adding backlog beyond a single in-flight frame per client.
-function streamToClient(res) {
-  let closed = false;
-  res.on("close", () => {
-    closed = true;
+function makePipeline(name) {
+  return { name, proc: null, wanted: false, restartExpected: false, lastPoll: 0, startedAt: 0, produced: 0, waiters: new Set(), buffer: Buffer.alloc(0), seq: 0 };
+}
+const jpeg = Object.assign(makePipeline("jpeg"), { frame: null });
+const h264 = Object.assign(makePipeline("h264"), {
+  encoder: process.env.H264_ENCODER || "vaapi",
+  frames: [], // {seq, key, data}, the newest last
+  au: [], // NAL units of the access unit being collected
+  sps: null,
+  pps: null,
+  codec: null,
+  epoch: 0, // bumped for every new ffmpeg: frames of different epochs cannot be decoded one after the other
+  width: 0,
+  height: 0,
+  step: 0, // index into H264_STEPS
+  skips: [], // times a continuing client was made to skip ahead
+  stepChangedAt: 0,
+});
+
+function setH264Step(step) {
+  if (step === h264.step) return;
+  console.error(`h264: bitrate step ${h264.step} -> ${step} (${H264_STEPS[step][0]} / ${H264_STEPS[step][1]})`);
+  h264.step = step;
+  h264.stepChangedAt = Date.now();
+  h264.skips = [];
+  if (h264.proc) {
+    h264.restartExpected = true;
+    h264.proc.kill("SIGTERM");
+  }
+}
+
+function noteH264Skip() {
+  const now = Date.now();
+  h264.skips = h264.skips.filter((t) => now - t < 20000);
+  h264.skips.push(now);
+  // two skips in 20 s, and the last change was a while ago (the new step needs a moment to show its effect)
+  if (h264.skips.length >= 2 && now - h264.stepChangedAt > 5000 && h264.step < H264_STEPS.length - 1) setH264Step(h264.step + 1);
+}
+
+setInterval(() => {
+  const quiet = Date.now() - Math.max(h264.stepChangedAt, h264.skips[h264.skips.length - 1] || 0);
+  if (h264.proc && h264.step > 0 && quiet > H264_STEP_UP_MS) setH264Step(h264.step - 1);
+}, 5000);
+
+function wake(p) {
+  for (const w of p.waiters) w();
+}
+
+function captureInput() {
+  return ["-f", "x11grab", "-draw_mouse", "0", "-framerate", String(TARGET_FPS), "-video_size", `${DISPLAY_WIDTH}x${DISPLAY_HEIGHT}`, "-i", DISPLAY];
+}
+
+function pipelineArgs(p) {
+  if (p === jpeg) return ["-loglevel", "error", ...captureInput(), "-f", "mpjpeg", "-boundary_tag", MJPEG_BOUNDARY, "-q:v", JPEG_QUALITY, "-flush_packets", "1", "pipe:1"];
+  const [bitrate, maxrate] = H264_STEPS[h264.step];
+  const common = ["-g", String(H264_GOP), "-bf", "0", "-maxrate", maxrate, "-flush_packets", "1", "-f", "h264", "pipe:1"];
+  if (h264.encoder === "vaapi") {
+    const vaapi = ["-c:v", "h264_vaapi", "-rc_mode", "VBR", "-b:v", bitrate, "-aud", "1", "-async_depth", "1"];
+    return ["-loglevel", "error", "-vaapi_device", "/dev/dri/renderD128", ...captureInput(), "-vf", "format=nv12,hwupload", ...vaapi, ...common];
+  }
+  const x264 = ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-crf", "23", "-bufsize", maxrate, "-x264-params", "aud=1:repeat-headers=1"];
+  return ["-loglevel", "error", ...captureInput(), "-vf", "format=yuv420p", ...x264, ...common];
+}
+
+function startPipeline(p) {
+  p.wanted = true;
+  if (p.proc) return;
+  p.buffer = Buffer.alloc(0);
+  p.startedAt = Date.now();
+  p.produced = 0;
+  if (p === h264) {
+    h264.epoch++;
+    h264.frames = [];
+    h264.au = [];
+    h264.width = DISPLAY_WIDTH;
+    h264.height = DISPLAY_HEIGHT;
+  }
+  const proc = spawn("ffmpeg", pipelineArgs(p), { env: childEnv, stdio: ["ignore", "pipe", "pipe"] });
+  proc.stdout.on("data", (chunk) => (p === jpeg ? parseJpegChunk(chunk) : parseH264Chunk(chunk)));
+  proc.stderr.on("data", (d) => process.stderr.write(`[ffmpeg ${p.name}] ${d}`));
+  proc.on("exit", (code, signal) => {
+    p.proc = null;
+    if (!p.wanted) return;
+    if (p.restartExpected) {
+      p.restartExpected = false;
+      return startPipeline(p);
+    }
+    // the GPU encoder died before its first frame: not available here, use the CPU encoder from now on
+    if (p === h264 && h264.encoder === "vaapi" && p.produced === 0) {
+      console.error("h264_vaapi failed, switching to libx264");
+      h264.encoder = "x264";
+      return startPipeline(p);
+    }
+    console.error(`ffmpeg ${p.name} exited (code=${code}, signal=${signal}) -- restarting in 1s`);
+    setTimeout(() => p.wanted && startPipeline(p), 1000);
   });
+  p.proc = proc;
+}
 
-  function sendNext() {
-    if (closed) return;
-    if (!lastFrame) {
-      setTimeout(sendNext, 50);
+function stopPipeline(p) {
+  p.wanted = false;
+  if (p.proc) p.proc.kill("SIGTERM");
+}
+
+// after a resize: ffmpeg's capture size is fixed when it starts
+function restartPipelines() {
+  for (const p of [jpeg, h264]) {
+    if (!p.proc) continue;
+    p.restartExpected = true;
+    p.proc.kill("SIGTERM");
+  }
+}
+
+// nobody asked for frames for a while (tab closed, switched to the other mode): stop encoding
+setInterval(() => {
+  for (const p of [jpeg, h264]) if (p.wanted && Date.now() - p.lastPoll > PIPELINE_IDLE_MS && p.waiters.size === 0) stopPipeline(p);
+}, 3000);
+
+// ffmpeg's mpjpeg output: "Content-type: image/jpeg\r\nContent-length: N\r\n\r\n<N bytes>" parts
+const HEADER_RE = /Content-type: image\/jpeg\r\nContent-length: (\d+)\r\n\r\n/i;
+function parseJpegChunk(chunk) {
+  jpeg.buffer = jpeg.buffer.length ? Buffer.concat([jpeg.buffer, chunk]) : chunk;
+  for (;;) {
+    const match = HEADER_RE.exec(jpeg.buffer.toString("latin1", 0, Math.min(jpeg.buffer.length, 256)));
+    if (!match) {
+      if (jpeg.buffer.length > 256) jpeg.buffer = jpeg.buffer.subarray(jpeg.buffer.length - 256);
       return;
     }
-    const seqAtSend = lastFrameSeq;
-    const frame = lastFrame;
-    res.write(`--${MJPEG_BOUNDARY}\r\nContent-type: image/jpeg\r\nContent-length: ${frame.length}\r\n\r\n`);
-    res.write(frame);
-    res.write("\r\n", (err) => {
-      if (err || closed) return;
-      if (lastFrameSeq === seqAtSend) {
-        // No new frame arrived while we were sending -- avoid a hot busy
-        // loop re-sending the identical frame; check back shortly instead.
-        setTimeout(sendNext, 1000 / TARGET_FPS);
-      } else {
-        sendNext();
-      }
-    });
-  }
-  sendNext();
-}
-
-// ffmpeg's own mpjpeg output is relayed raw by neither this nor the old
-// browser-relay approach -- both re-frame every part themselves (via
-// streamToClient above) rather than blindly forwarding ffmpeg's byte
-// stream. That matters here specifically because a client connecting
-// mid-stream would otherwise start receiving from an arbitrary byte offset
-// (not a frame boundary) with no priming at all, which some browsers/
-// proxies never recover from -- looks like a stream that "just loads
-// forever". Parsing ffmpeg's Content-length-delimited parts out of its
-// stdout into `lastFrame` and letting each client's own pull loop pick it up
-// (see streamToClient) guarantees every client always starts from -- and
-// stays on -- a valid, complete frame, never a partial one.
-let ffmpegBuffer = Buffer.alloc(0);
-const HEADER_RE = /Content-type: image\/jpeg\r\nContent-length: (\d+)\r\n\r\n/i;
-
-function parseFfmpegChunk(chunk) {
-  ffmpegBuffer = ffmpegBuffer.length ? Buffer.concat([ffmpegBuffer, chunk]) : chunk;
-  for (;;) {
-    const match = HEADER_RE.exec(ffmpegBuffer.toString("latin1"));
-    if (!match || match.index === undefined) return;
     const headerEnd = match.index + match[0].length;
-    const jpegLen = parseInt(match[1], 10);
-    if (ffmpegBuffer.length < headerEnd + jpegLen) return; // wait for more data
-    const jpegBuf = ffmpegBuffer.subarray(headerEnd, headerEnd + jpegLen);
-    lastFrame = Buffer.from(jpegBuf);
-    lastFrameSeq++;
-    ffmpegBuffer = ffmpegBuffer.subarray(headerEnd + jpegLen);
+    const length = parseInt(match[1], 10);
+    if (jpeg.buffer.length < headerEnd + length) return;
+    const frame = Buffer.from(jpeg.buffer.subarray(headerEnd, headerEnd + length));
+    jpeg.buffer = jpeg.buffer.subarray(headerEnd + length);
+    jpeg.produced++;
+    // the encoder is deterministic: an unchanged screen gives the same bytes, and that is no new frame
+    if (jpeg.frame && jpeg.frame.equals(frame)) continue;
+    jpeg.frame = frame;
+    jpeg.seq++;
+    wake(jpeg);
   }
 }
 
-// Set true immediately before deliberately killing ffmpeg (e.g. for a
-// resize, which needs a new -video_size) so its exit handler restarts it
-// right away instead of treating the exit as a crash and waiting 1s.
-let ffmpegRestartExpected = false;
-
-function startFfmpegCapture() {
-  // Reads DISPLAY_WIDTH/HEIGHT fresh at call time (not closed over at
-  // startup), so a restart after resizeDisplay() updates them picks up the
-  // new resolution automatically.
-  const args = [
-    "-loglevel",
-    "error",
-    "-f",
-    "x11grab",
-    "-video_size",
-    `${DISPLAY_WIDTH}x${DISPLAY_HEIGHT}`,
-    "-framerate",
-    String(TARGET_FPS),
-    "-i",
-    DISPLAY,
-    "-f",
-    "mpjpeg",
-    "-boundary_tag",
-    MJPEG_BOUNDARY,
-    "-q:v",
-    "5",
-    "pipe:1",
-  ];
-  const proc = spawn("ffmpeg", args, { env: childEnv, stdio: ["ignore", "pipe", "pipe"] });
-  proc.stdout.on("data", parseFfmpegChunk);
-  proc.stderr.on("data", (d) => process.stderr.write(`[ffmpeg] ${d}`));
-  proc.on("exit", (code, signal) => {
-    ffmpegBuffer = Buffer.alloc(0);
-    if (ffmpegRestartExpected) {
-      ffmpegRestartExpected = false;
-      startFfmpegCapture();
-    } else {
-      console.error(`ffmpeg exited (code=${code}, signal=${signal}) -- restarting in 1s`);
-      setTimeout(startFfmpegCapture, 1000);
-    }
-  });
-  ffmpegProc = proc;
-}
-
-function restartFfmpegCapture() {
-  if (!ffmpegProc) {
-    startFfmpegCapture();
+// ffmpeg's raw H.264 (Annex B): NAL units behind 00 00 01 start codes, every access unit (frame) opened by an AUD (type 9).
+// A frame is complete when the next AUD arrives, so it goes out one frame late (1/TARGET_FPS s) - the price for knowing where
+// it ends.
+const START_CODE = Buffer.from([0, 0, 1]);
+const START_CODE_4 = Buffer.from([0, 0, 0, 1]);
+function parseH264Chunk(chunk) {
+  let buf = h264.buffer.length ? Buffer.concat([h264.buffer, chunk]) : chunk;
+  let at = buf.indexOf(START_CODE);
+  if (at < 0) {
+    h264.buffer = buf;
     return;
   }
-  ffmpegRestartExpected = true;
-  ffmpegProc.kill("SIGTERM");
+  for (;;) {
+    const next = buf.indexOf(START_CODE, at + 3);
+    if (next < 0) break;
+    // a 4-byte start code's leading zero is not part of the NAL before it
+    const end = next > 0 && buf[next - 1] === 0 ? next - 1 : next;
+    onNal(Buffer.from(buf.subarray(at + 3, end)));
+    at = next;
+  }
+  h264.buffer = buf.subarray(at);
+}
+
+function onNal(nal) {
+  if (!nal.length) return;
+  const type = nal[0] & 0x1f;
+  if (type === 9) {
+    if (h264.au.some((n) => (n[0] & 0x1f) >= 1 && (n[0] & 0x1f) <= 5)) emitAccessUnit(h264.au);
+    h264.au = [];
+    return;
+  }
+  if (type === 7) {
+    h264.sps = nal;
+    h264.codec = `avc1.${[nal[1], nal[2], nal[3]].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+  }
+  if (type === 8) h264.pps = nal;
+  h264.au.push(nal);
+}
+
+function emitAccessUnit(nals) {
+  const key = nals.some((n) => (n[0] & 0x1f) === 5);
+  // a keyframe has to carry SPS/PPS itself: it is where a decoder starts
+  if (key && !nals.some((n) => (n[0] & 0x1f) === 7) && h264.sps && h264.pps) nals = [h264.sps, h264.pps, ...nals];
+  const data = Buffer.concat(nals.flatMap((n) => [START_CODE_4, n]));
+  h264.produced++;
+  h264.frames.push({ seq: ++h264.seq, key, data });
+  // keep the newest keyframe and everything after it, and at least 2 s
+  const lastKey = h264.frames.findLastIndex((f) => f.key);
+  const keepFrom = Math.max(0, Math.min(lastKey < 0 ? 0 : lastKey, h264.frames.length - 2 * TARGET_FPS));
+  if (keepFrom > 0) h264.frames.splice(0, keepFrom);
+  wake(h264);
+}
+
+// The H.264 frames a client needs after `after`: the next ones in order, or - for a new client, a new epoch, or one too far
+// behind - everything from the newest keyframe on.
+function h264FramesFor(after, epoch) {
+  const frames = h264.frames;
+  if (!frames.length || !h264.codec) return [];
+  const latest = frames[frames.length - 1].seq;
+  if (after >= latest && epoch === h264.epoch) return [];
+  const continuing = epoch === h264.epoch && frames[0].seq <= after + 1 && latest - after <= H264_MAX_LAG;
+  if (continuing) return frames.filter((f) => f.seq > after);
+  const lastKey = frames.findLastIndex((f) => f.key);
+  if (lastKey < 0) return [];
+  // the newest keyframe is not newer than what the client has: wait for the next one rather than going back in time
+  if (epoch === h264.epoch && frames[lastKey].seq <= after) return [];
+  if (epoch === h264.epoch && after >= 0) noteH264Skip();
+  return frames.slice(lastKey);
+}
+
+// Waits until `ready()` returns something or FRAME_WAIT_MS passes; answers 204 then. Ends early if the client goes away.
+function longPoll(p, req, res, ready, send) {
+  p.lastPoll = Date.now();
+  const now = ready();
+  if (now) return send(now);
+  let done = false;
+  const finish = (value) => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    p.waiters.delete(check);
+    p.lastPoll = Date.now();
+    if (value) send(value);
+    else if (!res.writableEnded) res.status(204).end();
+  };
+  const check = () => {
+    const value = ready();
+    if (value) finish(value);
+  };
+  const timer = setTimeout(() => finish(null), FRAME_WAIT_MS);
+  p.waiters.add(check);
+  req.on("close", () => finish(null));
+}
+
+// --- Pointer and mouse: one long-running xhelper (xhelper.c) instead of an xdotool process per event, and the source of the
+// pointer's shape for the browser. xdotool stays for the keyboard (its `type` handles any Unicode text). ---
+let helper = null;
+let cursor = null; // {version, serial, w, h, xhot, yhot, rgba}
+let cursorVersion = 0;
+const cursorWaiters = makePipeline("cursor"); // only its waiters/lastPoll are used
+
+// German characters on spare keys (unused multimedia keycodes) of the US keymap. Without them `xdotool type` remaps a scratch
+// key for every ä/ö/ü/ß/€ on the fly, and Chrome sometimes reads the key before the new mapping: about one word in six lost a
+// character. Free keycodes stay free for xdotool's on-the-fly mapping of rarer characters. Runs with every helper start,
+// which follows every Xvfb (re)start, since a new X server starts with the plain keymap.
+const GERMAN_KEYS = [
+  "keycode 189 = adiaeresis Adiaeresis",
+  "keycode 191 = odiaeresis Odiaeresis",
+  "keycode 192 = udiaeresis Udiaeresis",
+  "keycode 193 = ssharp U1E9E",
+  "keycode 194 = EuroSign section",
+  "keycode 195 = degree mu",
+  "keycode 196 = twosuperior threesuperior",
+];
+
+let germanKeysAt = 0;
+// Once seen lost right after the very first start (some X client reset the keymap), so it is also re-applied before typing
+// such characters, at most every 10 s; it is idempotent and takes a few ms.
+async function ensureGermanKeys(force = false) {
+  if (!force && Date.now() - germanKeysAt < 10000) return;
+  germanKeysAt = Date.now();
+  await execFilePromise("xmodmap", GERMAN_KEYS.flatMap((line) => ["-e", line])).catch((e) => console.error(`xmodmap failed: ${e.message}`));
+}
+
+function startHelper() {
+  ensureGermanKeys(true);
+  let out = "";
+  const proc = spawn(path.join(__dirname, "xhelper"), [], { env: childEnv, stdio: ["pipe", "pipe", "pipe"] });
+  proc.stdout.on("data", (d) => {
+    out += d.toString("latin1");
+    let nl;
+    while ((nl = out.indexOf("\n")) >= 0) {
+      const line = out.slice(0, nl);
+      out = out.slice(nl + 1);
+      const [tag, serial, w, h, xhot, yhot, rgba = ""] = line.split(" ");
+      if (tag !== "C") continue;
+      cursor = { version: ++cursorVersion, serial: Number(serial), w: Number(w), h: Number(h), xhot: Number(xhot), yhot: Number(yhot), rgba };
+      wake(cursorWaiters);
+    }
+  });
+  proc.stderr.on("data", (d) => process.stderr.write(`[xhelper] ${d}`));
+  proc.stdin.on("error", () => {});
+  proc.on("error", (e) => console.error(`xhelper failed to start: ${e.message}`));
+  proc.on("exit", (code) => {
+    if (helper === proc) helper = null;
+    console.error(`xhelper exited (code=${code}) -- restarting in 2s`);
+    setTimeout(startHelper, 2000);
+  });
+  helper = proc;
+}
+
+// sends lines to xhelper; without it (not built, crashed) the same through xdotool
+async function pointer(lines) {
+  if (helper && helper.stdin.writable) {
+    helper.stdin.write(lines.join("\n") + "\n");
+    return;
+  }
+  for (const line of lines) {
+    const [op, a, b] = line.split(" ");
+    if (op === "m") await xdotool(["mousemove", a, b]);
+    else if (op === "d") await xdotool(["mousedown", a]);
+    else if (op === "u") await xdotool(["mouseup", a]);
+    else if (op === "c") await xdotool(["click", "--repeat", b, a]);
+  }
 }
 
 // --- Audio out: Chrome's audio (default sink "chrome_out", see
@@ -432,11 +642,13 @@ async function resizeDisplay(width, height) {
   await execFilePromise("xrandr", ["--addmode", output, modeName]).catch(() => {});
   await execFilePromise("xrandr", ["--output", output, "--mode", modeName]);
 
-  DISPLAY_WIDTH = width;
-  DISPLAY_HEIGHT = height;
-  restartFfmpegCapture();
+  // cvt may round the mode; capture exactly what the screen now is (a too-large x11grab size makes ffmpeg fail)
+  const current = /current (\d+) x (\d+)/.exec(await execFilePromise("xrandr", []));
+  DISPLAY_WIDTH = current ? parseInt(current[1], 10) : width;
+  DISPLAY_HEIGHT = current ? parseInt(current[2], 10) : height;
+  restartPipelines();
 
-  await xdotool(["getactivewindow", "windowsize", String(width), String(height)]).catch(() => {});
+  await xdotool(["getactivewindow", "windowsize", String(DISPLAY_WIDTH), String(DISPLAY_HEIGHT)]).catch(() => {});
   await xdotool(["getactivewindow", "windowmove", "0", "0"]).catch(() => {});
 }
 
@@ -569,12 +781,17 @@ async function initDesktop() {
     "about:blank",
   ], () => { clearStaleChromeLockSync(); clearChromeMetrics(); });
 
-  startFfmpegCapture();
+  startHelper();
   startAudioCapture();
 }
 
 const app = express();
 app.use((req, res, next) => (req.path === "/clipboard" ? next() : express.json()(req, res, next)));
+// long polls and streams must reach the client as they are: tells a reverse proxy like nginx (NPM) not to buffer them
+app.use((req, res, next) => {
+  res.setHeader("X-Accel-Buffering", "no");
+  next();
+});
 const upload = multer({ dest: UPLOAD_TMP_DIR });
 
 app.get("/", (req, res) => {
@@ -583,30 +800,73 @@ app.get("/", (req, res) => {
 app.use("/static", express.static(__dirname + "/static"));
 
 app.get("/info", (req, res) => {
-  res.json({ width: DISPLAY_WIDTH, height: DISPLAY_HEIGHT, fps: TARGET_FPS });
+  res.json({ width: DISPLAY_WIDTH, height: DISPLAY_HEIGHT, fps: TARGET_FPS, encoder: h264.encoder, h264Step: H264_STEPS[h264.step].join("/"), h264Seq: h264.seq, jpegSeq: jpeg.seq });
 });
 
 app.post("/resize", async (req, res) => {
-  const width = Math.max(320, Math.min(3840, parseInt(req.body?.width, 10) || DISPLAY_WIDTH));
-  const height = Math.max(240, Math.min(2160, parseInt(req.body?.height, 10) || DISPLAY_HEIGHT));
+  // the H.264 encoders want even sizes; widths in steps of 8 match what cvt produces anyway
+  const width = Math.max(320, Math.min(3840, parseInt(req.body?.width, 10) || DISPLAY_WIDTH)) & ~7;
+  const height = Math.max(240, Math.min(2160, parseInt(req.body?.height, 10) || DISPLAY_HEIGHT)) & ~1;
   if (width === DISPLAY_WIDTH && height === DISPLAY_HEIGHT) {
     return res.json({ ok: true, width, height, changed: false });
   }
   try {
     await resizeDisplay(width, height);
-    res.json({ ok: true, width, height, changed: true });
+    res.json({ ok: true, width: DISPLAY_WIDTH, height: DISPLAY_HEIGHT, changed: true });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
   }
 });
 
-app.get("/stream", (req, res) => {
-  res.writeHead(200, {
-    "Content-Type": `multipart/x-mixed-replace; boundary=${MJPEG_BOUNDARY}`,
-    "Cache-Control": "no-cache, no-store, must-revalidate",
-    Pragma: "no-cache",
+// The newest JPEG frame once it is newer than `after` (X-Seq tells its number).
+app.get("/video/jpeg", (req, res) => {
+  const after = parseInt(req.query.after, 10) || 0;
+  startPipeline(jpeg);
+  longPoll(jpeg, req, res, () => jpeg.frame && jpeg.seq > after && { frame: jpeg.frame, seq: jpeg.seq }, ({ frame, seq }) => {
+    res.writeHead(200, { "Content-Type": "image/jpeg", "Content-Length": frame.length, "X-Seq": String(seq), "Cache-Control": "no-store" });
+    res.end(frame);
   });
-  streamToClient(res);
+});
+
+// H.264 frames after `after` of encoder run `epoch`, as one binary answer: per frame a 4-byte seq, a 1-byte keyframe flag, a
+// 4-byte length and the Annex B data. X-Codec / X-Epoch / X-Width / X-Height describe the stream; a client whose epoch differs
+// gets everything from the newest keyframe and has to configure a new decoder.
+app.get("/video/h264", (req, res) => {
+  const after = parseInt(req.query.after, 10);
+  const epoch = parseInt(req.query.epoch, 10);
+  startPipeline(h264);
+  longPoll(h264, req, res, () => {
+    const frames = h264FramesFor(Number.isNaN(after) ? -1 : after, Number.isNaN(epoch) ? -1 : epoch);
+    return frames.length > 0 && frames;
+  }, (frames) => {
+    const parts = [];
+    for (const f of frames) {
+      const head = Buffer.alloc(9);
+      head.writeUInt32BE(f.seq, 0);
+      head.writeUInt8(f.key ? 1 : 0, 4);
+      head.writeUInt32BE(f.data.length, 5);
+      parts.push(head, f.data);
+    }
+    const body = Buffer.concat(parts);
+    res.writeHead(200, {
+      "Content-Type": "application/octet-stream",
+      "Content-Length": body.length,
+      "Cache-Control": "no-store",
+      "X-Codec": h264.codec,
+      "X-Epoch": String(h264.epoch),
+      "X-Width": String(h264.width),
+      "X-Height": String(h264.height),
+      "X-Encoder": h264.encoder,
+      "X-Bitrate": H264_STEPS[h264.step][0],
+    });
+    res.end(body);
+  });
+});
+
+// The pointer's current shape once it differs from version `after`: {version, w, h, xhot, yhot, rgba (hex)}.
+app.get("/cursor", (req, res) => {
+  const after = parseInt(req.query.after, 10) || 0;
+  longPoll(cursorWaiters, req, res, () => cursor && cursor.version > after && cursor, (c) => res.json(c));
 });
 
 // Live audio out (Chrome's sound) -- see the "Audio out" block above for the
@@ -764,54 +1024,47 @@ const NAMED_KEY_TO_XDOTOOL = {
 };
 const MODIFIER_TO_XDOTOOL = { Control: "ctrl", Meta: "super", Alt: "alt", Shift: "shift" };
 
-app.post("/input/mouse", async (req, res) => {
-  const { type, x, y, button, deltaX, deltaY } = req.body || {};
-  try {
-    // No --sync on mousemove: it makes xdotool block until the X server
-    // confirms the pointer actually moved, which adds a round-trip that
-    // gets worse under load (ffmpeg is also hammering the same X server for
-    // capture) -- unnecessary since nothing here depends on the move having
-    // visibly completed before responding.
-    if (type === "move") {
-      await xdotool(["mousemove", String(x), String(y)]);
-    } else if (type === "down") {
-      await xdotool(["mousemove", String(x), String(y)]);
-      await xdotool(["mousedown", button === "right" ? "3" : button === "middle" ? "2" : "1"]);
-    } else if (type === "up") {
-      await xdotool(["mouseup", button === "right" ? "3" : button === "middle" ? "2" : "1"]);
-    } else if (type === "wheel") {
-      const clicks = Math.min(10, Math.max(1, Math.round(Math.abs(deltaY || 0) / 50)));
-      await xdotool(["click", "--repeat", String(clicks), deltaY > 0 ? "5" : "4"]);
-    }
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
-  }
-});
+const BUTTONS = { left: 1, middle: 2, right: 3 };
 
-app.post("/input/key", async (req, res) => {
-  const { action, key, text } = req.body || {};
+function xdotoolKeyCombo(key) {
+  // "Control+Shift+T"-style combo strings (see static/index.html) split
+  // into xdotool's lowercase-modifier "ctrl+shift+t" syntax. Critically,
+  // a bare letter must be lowercased unless "Shift" is explicitly one of
+  // the parts: X11 keysym "A" *is* shift+a, so "ctrl+A" from xdotool's
+  // perspective means Ctrl+Shift+a, not plain Ctrl+A -- the client
+  // already adds an explicit "Shift" part when it means to shift.
+  return key
+    .split("+")
+    .map((p) => MODIFIER_TO_XDOTOOL[p] || NAMED_KEY_TO_XDOTOOL[p] || (p.length === 1 ? p.toLowerCase() : p))
+    .join("+");
+}
+
+// All input in one ordered batch: the client keeps a single request in flight and collects what happens meanwhile (moves
+// merged into the newest one, typed characters into one string), so input can never pile up behind a slow connection.
+// Events: {t:"move",x,y} {t:"down",x,y,b} {t:"up",b} {t:"wheel",dx,dy} {t:"key",key} {t:"type",text}
+app.post("/input", async (req, res) => {
+  const events = Array.isArray(req.body?.events) ? req.body.events.slice(0, 500) : [];
   try {
-    if (action === "type") {
-      await xdotool(["type", "--", text]);
-    } else if (action === "press") {
-      // "Control+Shift+T"-style combo strings (see static/index.html) split
-      // into xdotool's lowercase-modifier "ctrl+shift+t" syntax. Critically,
-      // a bare letter must be lowercased unless "Shift" is explicitly one of
-      // the parts: X11 keysym "A" *is* shift+a, so "ctrl+A" from xdotool's
-      // perspective means Ctrl+Shift+a, not plain Ctrl+A -- the client
-      // already adds an explicit "Shift" part when it means to shift.
-      const parts = key.split("+");
-      const xdoParts = parts.map((p) => {
-        if (MODIFIER_TO_XDOTOOL[p]) return MODIFIER_TO_XDOTOOL[p];
-        if (NAMED_KEY_TO_XDOTOOL[p]) return NAMED_KEY_TO_XDOTOOL[p];
-        return p.length === 1 ? p.toLowerCase() : p;
-      });
-      await xdotool(["key", xdoParts.join("+")]);
+    for (const e of events) {
+      const button = BUTTONS[e.b] || 1;
+      if (e.t === "move") await pointer([`m ${e.x | 0} ${e.y | 0}`]);
+      else if (e.t === "down") await pointer([`m ${e.x | 0} ${e.y | 0}`, `d ${button}`]);
+      else if (e.t === "up") await pointer([`u ${button}`]);
+      else if (e.t === "wheel") {
+        const lines = [];
+        const steps = (d) => Math.min(10, Math.max(1, Math.round(Math.abs(d) / 50)));
+        if (Math.abs(e.dy || 0) >= 1) lines.push(`c ${e.dy > 0 ? 5 : 4} ${steps(e.dy)}`);
+        if (Math.abs(e.dx || 0) >= 1) lines.push(`c ${e.dx > 0 ? 7 : 6} ${steps(e.dx)}`);
+        if (lines.length) await pointer(lines);
+      } else if (e.t === "key" && typeof e.key === "string") await xdotool(["key", xdotoolKeyCombo(e.key)]);
+      else if (e.t === "type" && typeof e.text === "string" && e.text) {
+        if (/[^\x00-\x7f]/.test(e.text)) await ensureGermanKeys();
+        await xdotool(["type", "--", e.text]);
+      }
     }
     res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+  } catch (err) {
+    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
 });
 
